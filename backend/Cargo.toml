@@ -46,6 +46,7 @@ secrecy = "0.10"
 zstd = "0.14"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+tokio-util = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rustls = "0.23"
 axum = { version = "0.8", features = ["ws"] }
