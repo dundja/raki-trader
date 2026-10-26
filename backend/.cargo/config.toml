@@ -1,0 +1,4 @@
+# ts-rs writes generated TypeScript bindings here when the export tests run.
+# `relative = true` resolves the path against the directory containing `.cargo` (backend/).
+[env]
+TS_RS_EXPORT_DIR = { value = "../frontend/src/api/generated", relative = true }

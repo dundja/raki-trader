@@ -1,0 +1,20 @@
+# Local dev Postgres. These credentials are local-only, not secrets.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: raki
+      POSTGRES_PASSWORD: raki
+      POSTGRES_DB: raki
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - raki-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raki"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  raki-pg:

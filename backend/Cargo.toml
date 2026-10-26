@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/recorder",
+    "crates/feeds",
+    "crates/engine",
+    "crates/store",
+    "crates/api",
+    "crates/traderd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "UNLICENSED"
+publish = false
+
+# All third-party versions are pinned here so crates never edit this file.
+# A crate opts in with `dep = { workspace = true }`.
+[workspace.dependencies]
+# internal
+raki-core = { path = "crates/core" }
+raki-recorder = { path = "crates/recorder" }
+raki-feeds = { path = "crates/feeds" }
+raki-engine = { path = "crates/engine" }
+raki-store = { path = "crates/store" }
+raki-api = { path = "crates/api" }
+
+# shared
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+rust_decimal = { version = "1.43", features = ["serde-with-str"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio = { version = "1.54", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-rs = { version = "12", features = ["serde-compat"] }
+
+# per-feature (declared here so later tasks do not touch this file)
+secrecy = "0.10"
+zstd = "0.14"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustls = "0.23"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "rust_decimal", "uuid", "macros", "migrate"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+rsntp = "4"
+libc = "0.2"
+
+# dev
+wiremock = "0.6"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tempfile = "3"
+
+[profile.release]
+debug = "line-tables-only"

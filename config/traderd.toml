@@ -1,0 +1,22 @@
+# Non-secret runtime config. PolyBolt credentials come only from the env vars
+# POLY_API_KEY, POLY_API_SECRET and POLY_API_PASSPHRASE; never put them here.
+data_dir = "data"
+database_url = "postgres://raki:raki@127.0.0.1:5433/raki"
+api_bind = "127.0.0.1:8787"
+cors_origin = "http://localhost:3000"
+assets = ["btc", "eth", "sol"]
+
+[feeds]
+clob = true
+rtds_legacy = true
+# "auto": enabled only when all three POLY_API_* env vars are set.
+polybolt = "auto"
+binance = true
+coinbase = true
+
+[health]
+clock_max_offset_ms = 50
+ntp_servers = ["time.apple.com", "time.cloudflare.com", "pool.ntp.org"]
+ntp_interval_s = 60
+geoblock_interval_s = 300
+stale_ms = { clob_market = 10000, rtds_legacy = 3000, polybolt = 3000, binance = 5000, coinbase = 5000 }
