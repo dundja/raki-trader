@@ -396,8 +396,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2248,6 +2250,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsntp"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc507d0efdc8ce91a17455b1efe9ada6a21e2414470b3f1d84aefc7ebcf247bd"
+dependencies = [
+ "chrono",
+ "tokio",
+]
+
+[[package]]
 name = "rust_decimal"
 version = "1.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3351,18 +3363,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "raki-api",
  "raki-core",
  "raki-engine",
  "raki-feeds",
  "raki-recorder",
  "raki-store",
+ "rsntp",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
