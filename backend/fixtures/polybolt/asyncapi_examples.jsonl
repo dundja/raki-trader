@@ -1,0 +1,11 @@
+{"name": "authed:authed", "raw": "{\"op\":\"authed\",\"rid\":\"a1\"}"}
+{"name": "subscribed:subscribed", "raw": "{\"op\":\"subscribed\",\"channel\":\"price.crypto\",\"rid\":\"s1\"}"}
+{"name": "subscribed:subscribed-with-provider", "raw": "{\"op\":\"subscribed\",\"channel\":\"price.equity\",\"rid\":\"s2\",\"provider\":\"chainlink\"}"}
+{"name": "priceCrypto:snapshot", "raw": "{\"v\":1,\"channel\":\"price.crypto\",\"seq\":1,\"ts\":1788973000000,\"snapshot\":true,\"payload\":{\"symbol\":\"btcusd\",\"source\":\"pyth\",\"data\":[{\"timestamp\":1788972880000,\"value\":64123.5,\"full_accuracy_value\":\"64123.50000000\"},{\"timestamp\":1788972881000,\"value\":64125.1,\"full_accuracy_value\":\"64125.10000000\"}]}}"}
+{"name": "priceCrypto:live", "raw": "{\"v\":1,\"channel\":\"price.crypto\",\"seq\":2,\"ts\":1788973001000,\"payload\":{\"symbol\":\"btcusd\",\"value\":64126.0,\"full_accuracy_value\":\"64126.00000000\",\"timestamp\":1788973001000,\"source\":\"pyth\"}}"}
+{"name": "priceCryptoTwap:live", "raw": "{\"v\":1,\"channel\":\"price.crypto.twap\",\"seq\":3,\"ts\":1788973002000,\"payload\":{\"symbol\":\"btcusd\",\"value\":64120.7,\"full_accuracy_value\":\"64120.70000000\",\"timestamp\":1788973002000,\"window_seconds\":60,\"source\":\"chainlink\"}}"}
+{"name": "pong:pong", "raw": "{\"op\":\"pong\",\"rid\":\"p1\"}"}
+{"name": "error:auth_required", "raw": "{\"op\":\"error\",\"code\":\"auth_required\",\"channel\":\"price.crypto\",\"rid\":\"s1\"}"}
+{"name": "error:bad_filter", "raw": "{\"op\":\"error\",\"code\":\"bad_filter\",\"channel\":\"price.polymarket\",\"rid\":\"s2\"}"}
+{"name": "unsubscribed:unsubscribed", "raw": "{\"op\":\"unsubscribed\",\"channel\":\"price.crypto\"}"}
+{"name":"priceCryptoTwap:snapshot (shape per asyncapi/docs, values illustrative)","raw":"{\"v\":1,\"channel\":\"price.crypto.twap\",\"seq\":1,\"ts\":1788973000000,\"snapshot\":true,\"payload\":{\"symbol\":\"btcusd\",\"window_seconds\":60,\"source\":\"chainlink\",\"data\":[{\"timestamp\":1788972999000,\"value\":64119.9,\"full_accuracy_value\":\"64119.90000000\"},{\"timestamp\":1788973000000,\"value\":64120.2,\"full_accuracy_value\":\"64120.20000000\"}]}}"}

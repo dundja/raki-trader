@@ -21,3 +21,8 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Playwright artifacts
+frontend/e2e/screenshots/
+frontend/test-results/
+frontend/playwright-report/
