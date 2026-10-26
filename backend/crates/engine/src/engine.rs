@@ -1,1 +1,882 @@
-// implemented in Task 6
+//! The engine: consumes [`FeedEvent`]s and a 1 s tick, and emits [`EngineOutput`]s for the shell.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use raki_core::{
+    Asset, FeedEvent, LiveWindow, Outcome, SeriesRow, Source, WindowId, WindowRecord, WindowStatus,
+};
+
+use crate::book::BookState;
+use crate::cex::CexState;
+use crate::control::Control;
+use crate::oracle::OracleState;
+use crate::series::WindowPrices;
+use crate::windows::WindowState;
+
+/// A REST call the shell runs; its result comes back as a [`FeedEvent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    FetchGamma { slug: String },
+    FetchResolution { slug: String, condition_id: String },
+}
+
+// The brief fixes `Window(WindowRecord)` unboxed; outputs are few per second and short-lived.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum EngineOutput {
+    Series(Vec<SeriesRow>),
+    /// Upsert of the full current record.
+    Window(WindowRecord),
+    Requests(Vec<Request>),
+    /// The CLOB tokens to stay subscribed to; emitted when the set changes.
+    DesiredTokens(BTreeSet<String>),
+    /// A book snapshot disagreed with our delta-built book.
+    BookResync {
+        asset_id: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    pub assets: Vec<Asset>,
+    pub session_id: String,
+}
+
+#[derive(Debug)]
+pub struct Engine {
+    cfg: EngineConfig,
+    books: HashMap<String, BookState>,
+    oracle: OracleState,
+    cex: CexState,
+    windows: BTreeMap<WindowId, WindowState>,
+    control: Control,
+    book_resyncs: u32,
+    desired: BTreeSet<String>,
+}
+
+impl Engine {
+    pub fn new(cfg: EngineConfig, now_ms: i64) -> Engine {
+        Engine {
+            cfg,
+            books: HashMap::new(),
+            oracle: OracleState::default(),
+            cex: CexState::default(),
+            windows: BTreeMap::new(),
+            control: Control::new(now_ms),
+            book_resyncs: 0,
+            desired: BTreeSet::new(),
+        }
+    }
+
+    pub fn handle(&mut self, ev: FeedEvent, now_ms: i64) -> Vec<EngineOutput> {
+        let mut out = vec![];
+        match ev {
+            FeedEvent::Book {
+                asset_id,
+                bids,
+                asks,
+                ..
+            } => {
+                let had_state = self.books.contains_key(&asset_id);
+                let book = self.books.entry(asset_id.clone()).or_default();
+                if book.apply_snapshot(&bids, &asks) && had_state {
+                    self.book_resyncs += 1;
+                    out.push(EngineOutput::BookResync { asset_id });
+                }
+            }
+            FeedEvent::PriceChange { changes, .. } => {
+                for c in changes {
+                    // A delta without a base snapshot cannot build a correct book; the CLOB
+                    // always sends the snapshot first after (re)subscribing.
+                    if let Some(book) = self.books.get_mut(&c.asset_id) {
+                        book.apply_change(c.side, c.price, c.size);
+                    }
+                }
+            }
+            FeedEvent::FeedReset {
+                source: Source::ClobMarket,
+            } => self.books.clear(),
+            FeedEvent::Oracle {
+                asset,
+                kind,
+                source,
+                ts_ms,
+                value,
+            } => {
+                self.oracle.insert(asset, kind, source, ts_ms, value);
+                self.sync(now_ms, &mut out);
+            }
+            FeedEvent::CexQuote {
+                venue,
+                asset,
+                bid,
+                ask,
+                recv_ms,
+            } => self.cex.on_quote(venue, asset, bid, ask, recv_ms),
+            FeedEvent::UsdtUsd { price, recv_ms } => self.cex.on_usdt(price, recv_ms),
+            FeedEvent::GammaFetched {
+                slug,
+                window: Some(gamma),
+                ..
+            } => {
+                if let Some(w) =
+                    WindowId::parse_slug(&slug).and_then(|id| self.windows.get_mut(&id))
+                {
+                    w.apply_gamma(&gamma);
+                    self.sync(now_ms, &mut out);
+                }
+            }
+            FeedEvent::MarketResolved {
+                condition_id,
+                winning_asset_id,
+                winning_outcome,
+                recv_ms,
+            } => {
+                if let Some(w) = self.window_by_condition(&condition_id) {
+                    let rec = &w.rec;
+                    let winner = if rec.up_token.as_ref() == Some(&winning_asset_id) {
+                        Some(Outcome::Up)
+                    } else if rec.down_token.as_ref() == Some(&winning_asset_id) {
+                        Some(Outcome::Down)
+                    } else {
+                        match winning_outcome.as_str() {
+                            "Up" => Some(Outcome::Up),
+                            "Down" => Some(Outcome::Down),
+                            _ => None,
+                        }
+                    };
+                    match winner {
+                        Some(winner) => {
+                            w.apply_winner(winner, None, recv_ms);
+                            self.sync(now_ms, &mut out);
+                        }
+                        None => tracing::warn!(
+                            slug = %rec.slug,
+                            %winning_asset_id,
+                            %winning_outcome,
+                            "market_resolved winner matches neither token nor outcome label"
+                        ),
+                    }
+                }
+            }
+            FeedEvent::Resolution {
+                condition_id,
+                winner: Some(winner),
+                resolved_at,
+            } => {
+                if let Some(w) = self.window_by_condition(&condition_id) {
+                    w.apply_winner(winner, resolved_at, now_ms);
+                    self.sync(now_ms, &mut out);
+                }
+            }
+            // Recorded raw; nothing to track in M1. A 404, a failed fetch or an unresolved
+            // market is retried on the window's own schedule.
+            FeedEvent::BestBidAsk { .. }
+            | FeedEvent::LastTrade { .. }
+            | FeedEvent::TickSize { .. }
+            | FeedEvent::FeedReset { .. }
+            | FeedEvent::GammaFetched { window: None, .. }
+            | FeedEvent::GammaFailed { .. }
+            | FeedEvent::Resolution { winner: None, .. } => {}
+        }
+        out
+    }
+
+    /// Called once per second.
+    pub fn tick(&mut self, now_ms: i64) -> Vec<EngineOutput> {
+        let now_s = now_ms.div_euclid(1000);
+        for &asset in &self.cfg.assets {
+            let current = WindowId::containing(asset, now_s);
+            for id in [current, current.next()] {
+                self.windows
+                    .entry(id)
+                    .or_insert_with(|| WindowState::new(id, &self.cfg.session_id, now_ms));
+            }
+        }
+        self.oracle.prune(now_ms);
+
+        let mut out = vec![];
+        self.sync(now_ms, &mut out);
+
+        let mut rows = vec![];
+        for w in self.windows.values_mut() {
+            if w.rec.status == WindowStatus::Live {
+                w.rec.coverage_secs += 1;
+                let prices = prices(&self.oracle, &self.cex, &self.books, &w.rec);
+                rows.push(prices.series_row(&w.rec.slug, now_s));
+            }
+        }
+        if !rows.is_empty() {
+            out.push(EngineOutput::Series(rows));
+        }
+
+        let requests: Vec<Request> = self
+            .windows
+            .values_mut()
+            .flat_map(|w| w.due_requests(now_ms))
+            .collect();
+        if !requests.is_empty() {
+            out.push(EngineOutput::Requests(requests));
+        }
+        out
+    }
+
+    /// The current window of every configured asset, with the latest prices.
+    pub fn live_windows(&self, now_ms: i64) -> Vec<LiveWindow> {
+        self.cfg
+            .assets
+            .iter()
+            .map(|&asset| {
+                let id = WindowId::containing(asset, now_ms.div_euclid(1000));
+                let rec = self.windows.get(&id).map(|w| &w.rec);
+                let p = match rec {
+                    Some(rec) => prices(&self.oracle, &self.cex, &self.books, rec),
+                    None => WindowPrices::collect(
+                        asset,
+                        None,
+                        None,
+                        &self.oracle,
+                        &self.cex,
+                        &self.books,
+                    ),
+                };
+                LiveWindow {
+                    asset,
+                    slug: id.slug(),
+                    start_ts: id.start,
+                    end_ts: id.end(),
+                    secs_left: id.secs_left(now_ms),
+                    price_to_beat: rec.and_then(|r| r.price_to_beat_ours.or(r.price_to_beat_gamma)),
+                    twap: p.twap.map(|(_, value)| value),
+                    twap_ts_ms: p.twap.map(|(ts, _)| ts),
+                    chainlink: p.chainlink,
+                    binance_mid_usd: p.binance_mid_usd,
+                    coinbase_mid: p.coinbase_mid,
+                    up_bid: p.up_bid,
+                    up_ask: p.up_ask,
+                    down_bid: p.down_bid,
+                    down_ask: p.down_ask,
+                }
+            })
+            .collect()
+    }
+
+    pub fn control(&mut self) -> &mut Control {
+        &mut self.control
+    }
+
+    pub fn book_resyncs(&self) -> u32 {
+        self.book_resyncs
+    }
+
+    fn window_by_condition(&mut self, condition_id: &str) -> Option<&mut WindowState> {
+        self.windows
+            .values_mut()
+            .find(|w| w.rec.condition_id.as_deref() == Some(condition_id))
+    }
+
+    /// Recomputes every window, emits the changed records, forgets finished windows and emits
+    /// the desired token set if it changed (dropping the books of tokens no longer wanted).
+    fn sync(&mut self, now_ms: i64, out: &mut Vec<EngineOutput>) {
+        for w in self.windows.values_mut() {
+            w.refresh(&self.oracle, now_ms);
+            if let Some(rec) = w.take_changed(now_ms) {
+                out.push(EngineOutput::Window(rec));
+            }
+        }
+        self.windows.retain(|_, w| !w.droppable(now_ms));
+
+        let desired: BTreeSet<String> = self
+            .windows
+            .values()
+            .filter(|w| w.wants_tokens())
+            .flat_map(|w| w.tokens().cloned())
+            .collect();
+        if desired != self.desired {
+            // An unsubscribed token's book would only go stale.
+            self.books.retain(|asset_id, _| desired.contains(asset_id));
+            self.desired = desired.clone();
+            out.push(EngineOutput::DesiredTokens(desired));
+        }
+    }
+}
+
+fn prices(
+    oracle: &OracleState,
+    cex: &CexState,
+    books: &HashMap<String, BookState>,
+    rec: &WindowRecord,
+) -> WindowPrices {
+    WindowPrices::collect(
+        rec.asset,
+        rec.up_token.as_deref(),
+        rec.down_token.as_deref(),
+        oracle,
+        cex,
+        books,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use raki_core::{
+        GammaWindow, Level, OracleKind, Outcome, PriceChangeEntry, Side, Source, Venue,
+        WindowStatus,
+    };
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::windows::GIVE_UP_MS;
+
+    const START: i64 = 1793031000;
+    const NEXT: i64 = START + 300;
+    const START_MS: i64 = START * 1000;
+    const END_MS: i64 = NEXT * 1000;
+
+    fn engine() -> Engine {
+        Engine::new(
+            EngineConfig {
+                assets: vec![Asset::Btc],
+                session_id: "session-1".into(),
+            },
+            START_MS,
+        )
+    }
+
+    fn slug(start: i64) -> String {
+        format!("btc-updown-5m-{start}")
+    }
+
+    fn up(start: i64) -> String {
+        format!("up-{start}")
+    }
+
+    fn down(start: i64) -> String {
+        format!("down-{start}")
+    }
+
+    fn cond(start: i64) -> String {
+        format!("cond-{start}")
+    }
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn gamma(start: i64, final_price: Option<f64>) -> FeedEvent {
+        FeedEvent::GammaFetched {
+            slug: slug(start),
+            window: Some(GammaWindow {
+                slug: slug(start),
+                event_id: format!("ev-{start}"),
+                start,
+                end: start + 300,
+                condition_id: cond(start),
+                up_token: up(start),
+                down_token: down(start),
+                price_to_beat: Some(99.5),
+                final_price,
+                closed: final_price.is_some(),
+                twap_lookback_s: Some(60),
+                fee_rate: None,
+                tick_size: None,
+            }),
+            recv_ms: 0,
+        }
+    }
+
+    fn twap(ts_ms: i64, value: f64) -> FeedEvent {
+        FeedEvent::Oracle {
+            asset: Asset::Btc,
+            kind: OracleKind::Twap60,
+            source: Source::RtdsLegacy,
+            ts_ms,
+            value,
+        }
+    }
+
+    fn book(asset_id: &str, bid: &str, ask: &str) -> FeedEvent {
+        FeedEvent::Book {
+            asset_id: asset_id.into(),
+            market: "m".into(),
+            ts_ms: 0,
+            bids: vec![Level {
+                price: d(bid),
+                size: d("10"),
+            }],
+            asks: vec![Level {
+                price: d(ask),
+                size: d("10"),
+            }],
+        }
+    }
+
+    fn requests(out: &[EngineOutput]) -> Vec<Request> {
+        out.iter()
+            .flat_map(|o| match o {
+                EngineOutput::Requests(r) => r.clone(),
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    fn rows(out: &[EngineOutput], start: i64) -> Vec<SeriesRow> {
+        out.iter()
+            .flat_map(|o| match o {
+                EngineOutput::Series(r) => r.clone(),
+                _ => vec![],
+            })
+            .filter(|r| r.slug == slug(start))
+            .collect()
+    }
+
+    fn window_outputs(out: &[EngineOutput], start: i64) -> Vec<WindowRecord> {
+        out.iter()
+            .filter_map(|o| match o {
+                EngineOutput::Window(w) if w.slug == slug(start) => Some(w.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn desired(out: &[EngineOutput]) -> Option<BTreeSet<String>> {
+        out.iter().rev().find_map(|o| match o {
+            EngineOutput::DesiredTokens(t) => Some(t.clone()),
+            _ => None,
+        })
+    }
+
+    fn record(e: &Engine, start: i64) -> WindowRecord {
+        e.windows[&WindowId {
+            asset: Asset::Btc,
+            start,
+        }]
+            .rec
+            .clone()
+    }
+
+    fn fetch_gamma(start: i64) -> Request {
+        Request::FetchGamma { slug: slug(start) }
+    }
+
+    fn fetch_resolution(start: i64) -> Request {
+        Request::FetchResolution {
+            slug: slug(start),
+            condition_id: cond(start),
+        }
+    }
+
+    /// An engine past discovery: both windows known from Gamma.
+    fn discovered(final_price: Option<f64>) -> Engine {
+        let mut e = engine();
+        e.tick(START_MS + 1000);
+        e.handle(gamma(START, final_price), START_MS + 1100);
+        e.handle(gamma(NEXT, None), START_MS + 1200);
+        e
+    }
+
+    #[test]
+    fn discovery_requests_current_and_next() {
+        let mut e = engine();
+        let reqs = requests(&e.tick(START_MS + 1000));
+        assert!(reqs.contains(&fetch_gamma(START)), "{reqs:?}");
+        assert!(reqs.contains(&fetch_gamma(NEXT)), "{reqs:?}");
+
+        assert_eq!(requests(&e.tick(START_MS + 2000)), vec![]);
+        assert_eq!(requests(&e.tick(START_MS + 5999)), vec![]);
+        let again = requests(&e.tick(START_MS + 6000));
+        assert!(
+            again.contains(&fetch_gamma(START)),
+            "still no condition_id: {again:?}"
+        );
+    }
+
+    #[test]
+    fn gamma_fetched_sets_desired_tokens() {
+        let mut e = engine();
+        e.tick(START_MS + 1000);
+
+        let out = e.handle(gamma(START, None), START_MS + 1100);
+        let w = window_outputs(&out, START).pop().expect("window upsert");
+        assert_eq!(w.condition_id, Some(cond(START)));
+        assert_eq!(w.event_id, Some(format!("ev-{START}")));
+        assert_eq!(w.up_token, Some(up(START)));
+        assert_eq!(w.down_token, Some(down(START)));
+        assert_eq!(w.price_to_beat_gamma, Some(99.5));
+        assert_eq!(w.status, WindowStatus::Live);
+        assert_eq!(w.session_id, "session-1");
+        assert_eq!(w.updated_ms, START_MS + 1100);
+        assert_eq!(
+            desired(&out),
+            Some(BTreeSet::from([up(START), down(START)]))
+        );
+
+        let out = e.handle(gamma(NEXT, None), START_MS + 1200);
+        assert_eq!(
+            desired(&out),
+            Some(BTreeSet::from([
+                up(START),
+                down(START),
+                up(NEXT),
+                down(NEXT)
+            ]))
+        );
+
+        let out = e.handle(gamma(NEXT, None), START_MS + 1300);
+        assert_eq!(desired(&out), None, "unchanged set is not re-emitted");
+        assert!(window_outputs(&out, NEXT).is_empty(), "unchanged record");
+
+        let reqs = requests(&e.tick(START_MS + 7000));
+        assert!(!reqs.contains(&fetch_gamma(START)), "{reqs:?}");
+    }
+
+    #[test]
+    fn ours_ptb_and_final_from_twap_points_and_tie_is_up() {
+        let mut e = discovered(None);
+        e.handle(twap(START_MS - 1000, 98.0), START_MS + 1300);
+        let out = e.handle(twap(START_MS, 100.0), START_MS + 1400);
+        let w = window_outputs(&out, START).pop().expect("ptb emitted");
+        assert_eq!(w.price_to_beat_ours, Some(100.0));
+        assert_eq!(w.twap_source, Some(Source::RtdsLegacy));
+        assert_eq!(w.final_twap_ours, None);
+        assert_eq!(w.outcome_ours, None);
+
+        e.handle(twap(END_MS - 1000, 101.0), END_MS - 500);
+        let out = e.handle(twap(END_MS, 100.0), END_MS + 100);
+        let w = window_outputs(&out, START).pop().expect("final emitted");
+        assert_eq!(w.final_twap_ours, Some(100.0));
+        assert_eq!(w.outcome_ours, Some(Outcome::Up));
+        assert_eq!(w.twap_source, Some(Source::RtdsLegacy));
+        // The final point of this window is the next window's price to beat.
+        assert_eq!(record(&e, NEXT).price_to_beat_ours, Some(100.0));
+    }
+
+    #[test]
+    fn outcome_down_when_final_below_ptb() {
+        let mut e = discovered(None);
+        e.handle(twap(START_MS, 100.0), START_MS + 1300);
+        e.handle(twap(END_MS, 99.99), END_MS + 100);
+        assert_eq!(record(&e, START).outcome_ours, Some(Outcome::Down));
+    }
+
+    #[test]
+    fn twap_match_true_when_equal_to_gamma_final() {
+        let mut e = discovered(None);
+        e.handle(twap(START_MS, 100.0), START_MS + 1300);
+        e.handle(twap(END_MS, 100.25), END_MS + 100);
+        assert_eq!(record(&e, START).twap_match, None, "gamma final unknown");
+        let out = e.handle(gamma(START, Some(100.25)), END_MS + 130_000);
+        let w = window_outputs(&out, START).pop().unwrap();
+        assert_eq!(w.final_price_gamma, Some(100.25));
+        assert_eq!(w.twap_match, Some(true));
+
+        let mut e = discovered(Some(100.26));
+        e.handle(twap(END_MS, 100.25), END_MS + 100);
+        assert_eq!(record(&e, START).twap_match, Some(false));
+    }
+
+    #[test]
+    fn resolution_latched() {
+        let mut e = discovered(None);
+        let resolution = |winner, resolved_at| FeedEvent::Resolution {
+            condition_id: cond(START),
+            winner,
+            resolved_at,
+        };
+        let out = e.handle(
+            resolution(Some(Outcome::Down), Some(1793031327)),
+            END_MS + 61_000,
+        );
+        let w = window_outputs(&out, START).pop().unwrap();
+        assert_eq!(w.winner, Some(Outcome::Down));
+        assert_eq!(w.resolved_at, Some(1793031327));
+        assert_eq!(w.resolution_seen_ms, Some(END_MS + 61_000));
+        assert_eq!(w.status, WindowStatus::Resolved);
+
+        e.handle(resolution(None, None), END_MS + 66_000);
+        let rec = record(&e, START);
+        assert_eq!(rec.winner, Some(Outcome::Down));
+        assert_eq!(rec.resolved_at, Some(1793031327));
+        assert_eq!(rec.resolution_seen_ms, Some(END_MS + 61_000));
+    }
+
+    #[test]
+    fn market_resolved_ws_sets_winner_by_token() {
+        let mut e = discovered(None);
+        e.handle(book(&up(START), "0.98", "0.99"), END_MS - 1000);
+        e.handle(book(&up(NEXT), "0.50", "0.52"), END_MS - 1000);
+        e.tick(END_MS + 1000);
+        let out = e.handle(
+            FeedEvent::MarketResolved {
+                condition_id: cond(START),
+                winning_asset_id: up(START),
+                winning_outcome: "not-a-label".into(),
+                recv_ms: END_MS + 26_000,
+            },
+            END_MS + 26_050,
+        );
+        let w = window_outputs(&out, START).pop().unwrap();
+        assert_eq!(w.winner, Some(Outcome::Up));
+        assert_eq!(w.resolution_seen_ms, Some(END_MS + 26_000));
+        assert_eq!(w.resolved_at, None);
+        assert_eq!(w.status, WindowStatus::Resolved);
+        assert_eq!(
+            desired(&out),
+            Some(BTreeSet::from([up(NEXT), down(NEXT)])),
+            "a resolved window's tokens are no longer wanted"
+        );
+        assert!(!e.books.contains_key(&up(START)), "its book is dropped");
+        assert!(e.books.contains_key(&up(NEXT)));
+    }
+
+    #[test]
+    fn resolution_requests_start_after_60s_every_5s() {
+        let mut e = discovered(None);
+        let mut sent = vec![];
+        for now in (END_MS..=END_MS + 80_000).step_by(1000) {
+            if requests(&e.tick(now)).contains(&fetch_resolution(START)) {
+                sent.push((now - END_MS) / 1000);
+            }
+        }
+        assert_eq!(sent, vec![60, 65, 70, 75, 80]);
+
+        e.handle(
+            FeedEvent::Resolution {
+                condition_id: cond(START),
+                winner: Some(Outcome::Up),
+                resolved_at: None,
+            },
+            END_MS + 81_000,
+        );
+        for now in (END_MS + 81_000..END_MS + 100_000).step_by(1000) {
+            assert!(!requests(&e.tick(now)).contains(&fetch_resolution(START)));
+        }
+    }
+
+    #[test]
+    fn gamma_final_polling_times_out() {
+        let mut e = discovered(None);
+        let (mut gamma_at, mut other_at, mut last_window) = (vec![], vec![], None);
+        for now in (END_MS..=END_MS + GIVE_UP_MS + 120_000).step_by(1000) {
+            let out = e.tick(now);
+            for r in requests(&out) {
+                if r == fetch_gamma(START) {
+                    gamma_at.push((now - END_MS) / 1000);
+                } else if r == fetch_resolution(START) {
+                    other_at.push(now - END_MS);
+                }
+            }
+            if let Some(w) = window_outputs(&out, START).pop() {
+                last_window = Some(w);
+            }
+        }
+        let expected: Vec<i64> = (120..1800).step_by(30).collect();
+        assert_eq!(gamma_at, expected);
+        assert!(
+            other_at.iter().all(|&t| t < GIVE_UP_MS),
+            "resolution polls stop too"
+        );
+        let w = last_window.expect("status changes were emitted");
+        assert_eq!(w.status, WindowStatus::TimedOut);
+        assert_eq!(w.updated_ms, END_MS + GIVE_UP_MS);
+        assert!(
+            !e.windows.contains_key(&WindowId {
+                asset: Asset::Btc,
+                start: START,
+            }),
+            "dropped 60 s after timing out"
+        );
+    }
+
+    #[test]
+    fn complete_needs_winner_and_gamma_final_then_is_dropped() {
+        let mut e = discovered(Some(100.0));
+        e.handle(
+            FeedEvent::Resolution {
+                condition_id: cond(START),
+                winner: Some(Outcome::Up),
+                resolved_at: Some(NEXT + 30),
+            },
+            END_MS + 61_000,
+        );
+        let out = e.tick(END_MS + 62_000);
+        assert_eq!(record(&e, START).status, WindowStatus::Complete);
+        assert!(requests(&out).iter().all(|r| match r {
+            Request::FetchGamma { slug: s } | Request::FetchResolution { slug: s, .. } =>
+                *s != slug(START),
+        }));
+        // Complete since the resolution arrived at end + 61 s.
+        e.tick(END_MS + 61_000 + 59_000);
+        assert!(e.windows.keys().any(|id| id.start == START));
+        e.tick(END_MS + 61_000 + 60_000);
+        assert!(!e.windows.keys().any(|id| id.start == START));
+    }
+
+    #[test]
+    fn series_rows_only_while_live_and_count_coverage() {
+        let mut e = engine();
+        let mut live_rows = vec![];
+        for i in 0..10 {
+            live_rows.extend(rows(&e.tick(START_MS + i * 1000), START));
+        }
+        assert_eq!(live_rows.len(), 10);
+        assert_eq!(live_rows[0].ts, START);
+        assert_eq!(live_rows[9].ts, START + 9);
+        assert!(live_rows.iter().all(|r| r.twap.is_none()));
+        assert_eq!(record(&e, START).coverage_secs, 10);
+
+        for now in [END_MS, END_MS + 1000, END_MS + 2000] {
+            let out = e.tick(now);
+            assert!(rows(&out, START).is_empty());
+            assert_eq!(rows(&out, NEXT).len(), 1, "the next window is live now");
+        }
+        assert_eq!(record(&e, START).coverage_secs, 10);
+    }
+
+    #[test]
+    fn series_row_carries_latest_prices() {
+        let mut e = discovered(None);
+        e.handle(twap(START_MS + 4000, 100.5), START_MS + 4100);
+        e.handle(
+            FeedEvent::Oracle {
+                asset: Asset::Btc,
+                kind: OracleKind::Chainlink,
+                source: Source::Polybolt,
+                ts_ms: START_MS + 4000,
+                value: 100.7,
+            },
+            START_MS + 4100,
+        );
+        e.handle(
+            FeedEvent::CexQuote {
+                venue: Venue::Binance,
+                asset: Asset::Btc,
+                bid: d("100"),
+                ask: d("100.2"),
+                recv_ms: START_MS + 4200,
+            },
+            START_MS + 4200,
+        );
+        e.handle(
+            FeedEvent::UsdtUsd {
+                price: d("1"),
+                recv_ms: START_MS + 4200,
+            },
+            START_MS + 4200,
+        );
+        e.handle(book(&up(START), "0.55", "0.57"), START_MS + 4300);
+        e.handle(book(&down(START), "0.43", "0.45"), START_MS + 4300);
+
+        let row = rows(&e.tick(START_MS + 5000), START).pop().unwrap();
+        assert_eq!(row.twap, Some(100.5));
+        assert_eq!(row.chainlink, Some(100.7));
+        assert!((row.binance_mid_usd.unwrap() - 100.1).abs() < 1e-9);
+        assert_eq!(row.coinbase_mid, None);
+        assert_eq!((row.up_bid, row.up_ask), (Some(d("0.55")), Some(d("0.57"))));
+        assert_eq!(
+            (row.down_bid, row.down_ask),
+            (Some(d("0.43")), Some(d("0.45")))
+        );
+
+        let live = e.live_windows(START_MS + 5000);
+        assert_eq!(live.len(), 1);
+        let lw = &live[0];
+        assert_eq!(lw.slug, slug(START));
+        assert_eq!(lw.secs_left, 295.0);
+        assert_eq!(
+            lw.price_to_beat,
+            Some(99.5),
+            "gamma ptb until ours is known"
+        );
+        assert_eq!(
+            (lw.twap, lw.twap_ts_ms),
+            (Some(100.5), Some(START_MS + 4000))
+        );
+        assert_eq!(lw.up_ask, Some(d("0.57")));
+    }
+
+    #[test]
+    fn book_resync_and_price_change_per_asset() {
+        let mut e = discovered(None);
+        let first = e.handle(book(&up(START), "0.55", "0.57"), START_MS + 2000);
+        assert!(
+            !first
+                .iter()
+                .any(|o| matches!(o, EngineOutput::BookResync { .. }))
+        );
+
+        e.handle(
+            FeedEvent::PriceChange {
+                market: "m".into(),
+                ts_ms: 0,
+                changes: vec![PriceChangeEntry {
+                    asset_id: up(START),
+                    price: d("0.56"),
+                    size: d("4"),
+                    side: Side::Buy,
+                    best_bid: Some(d("0.56")),
+                    best_ask: Some(d("0.57")),
+                }],
+            },
+            START_MS + 2100,
+        );
+        assert_eq!(e.books[&up(START)].best_bid(), Some(d("0.56")));
+
+        // A snapshot that disagrees with the delta-built book is a resync.
+        let out = e.handle(book(&up(START), "0.55", "0.57"), START_MS + 2200);
+        assert!(out.contains(&EngineOutput::BookResync {
+            asset_id: up(START)
+        }));
+        assert_eq!(e.book_resyncs(), 1);
+
+        // An identical snapshot is not.
+        let out = e.handle(book(&up(START), "0.55", "0.57"), START_MS + 2300);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, EngineOutput::BookResync { .. }))
+        );
+        assert_eq!(e.book_resyncs(), 1);
+    }
+
+    #[test]
+    fn feed_reset_clears_books() {
+        let mut e = discovered(None);
+        e.handle(book(&up(START), "0.55", "0.57"), START_MS + 2000);
+        e.handle(book(&down(START), "0.43", "0.45"), START_MS + 2000);
+
+        e.handle(
+            FeedEvent::FeedReset {
+                source: Source::Binance,
+            },
+            START_MS + 2100,
+        );
+        assert_eq!(e.books.len(), 2, "only a CLOB reset clears books");
+
+        e.handle(
+            FeedEvent::FeedReset {
+                source: Source::ClobMarket,
+            },
+            START_MS + 2200,
+        );
+        assert!(e.books.is_empty());
+        let row = rows(&e.tick(START_MS + 3000), START).pop().unwrap();
+        assert_eq!((row.up_bid, row.up_ask), (None, None));
+
+        // The fresh snapshot after a reconnect is a new base, not a resync.
+        let out = e.handle(book(&up(START), "0.60", "0.62"), START_MS + 3100);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, EngineOutput::BookResync { .. }))
+        );
+        assert_eq!(e.book_resyncs(), 0);
+    }
+
+    #[test]
+    fn control_is_reachable_and_starts_paused() {
+        let mut e = engine();
+        assert_eq!(
+            e.control().state().stop_kind,
+            Some(raki_core::StopKind::Startup)
+        );
+    }
+}
