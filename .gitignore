@@ -1,0 +1,23 @@
+# Secrets: never commit
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# Recorded market data (large, local)
+data/
+
+# Rust
+target/
+
+# Node / frontend
+node_modules/
+.output/
+.vinxi/
+dist/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
