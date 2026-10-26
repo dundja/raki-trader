@@ -9,7 +9,9 @@ publish.workspace = true
 [dependencies]
 raki-core = { workspace = true }
 raki-recorder = { workspace = true }
+chrono = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
+reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -22,3 +24,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rustls = { workspace = true }
+wiremock = { workspace = true }
