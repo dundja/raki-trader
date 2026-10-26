@@ -11,7 +11,7 @@ raki-core = { workspace = true }
 raki-recorder = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
