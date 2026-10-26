@@ -210,15 +210,11 @@ async fn get_json<T: DeserializeOwned>(app: &Router, uri: &str) -> (StatusCode, 
 }
 
 fn post(uri: &str, body: Option<&str>) -> Request<Body> {
-    let mut b = Request::post(uri);
-    let body = match body {
-        Some(json) => {
-            b = b.header(header::CONTENT_TYPE, "application/json");
-            Body::from(json.to_owned())
-        }
-        None => Body::empty(),
-    };
-    b.body(body).unwrap()
+    // The dashboard always sends the JSON content type, even with an empty body.
+    Request::post(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |json| Body::from(json.to_owned())))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -443,6 +439,73 @@ async fn control_pause_and_kill_forward_reason_with_optional_body() {
     // A malformed body is the caller's mistake.
     let (status, _) = send(&app, post("/api/control/kill", Some("{nope"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A cross-origin page can send `text/plain` (or nothing) without a preflight. Such a POST must be
+/// refused before anything reaches the control channel.
+#[tokio::test]
+async fn control_rejects_non_json_content_type() {
+    let h = harness().await;
+    for uri in [
+        "/api/control/pause",
+        "/api/control/resume",
+        "/api/control/kill",
+    ] {
+        let (app, mut rx) = app_with_control(&h);
+        let cases = [
+            // text/plain with a valid JSON body, the CSRF shape.
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(r#"{"acknowledge":true}"#))
+                .unwrap(),
+            // form-encoded, the other simple type.
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("acknowledge=true"))
+                .unwrap(),
+            // no header, no body.
+            Request::post(uri).body(Body::empty()).unwrap(),
+            // a look-alike type.
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/jsonx")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        for req in cases {
+            let (status, body) = send(&app, req).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{uri}");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(v["error"].is_string());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "{uri}: nothing may reach the control channel"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_accepts_json_with_charset_and_empty_body() {
+    let h = harness().await;
+    let (app, rx) = app_with_control(&h);
+    let responder = answer_once(
+        rx,
+        ControlResponse {
+            ok: true,
+            state: control_state(TradingMode::Paused),
+            error: None,
+        },
+    );
+    let req = Request::post("/api/control/pause")
+        .header(header::CONTENT_TYPE, "Application/JSON; charset=utf-8")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        responder.await.unwrap(),
+        ControlCommand::Pause { reason: None }
+    );
 }
 
 #[tokio::test]

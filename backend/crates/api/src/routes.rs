@@ -6,7 +6,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use raki_core::{
     Asset, ControlRequest, ControlResponse, HealthSnapshot, LiveSnapshot, RecordingStats,
@@ -24,6 +24,7 @@ const MAX_LIMIT: i64 = 500;
 
 pub enum ApiError {
     BadRequest(String),
+    UnsupportedMediaType(String),
     NotFound(String),
     Unavailable(String),
     Internal(anyhow::Error),
@@ -33,6 +34,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::UnsupportedMediaType(m) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Internal(e) => {
@@ -105,13 +107,21 @@ pub async fn get_series(
     Ok(Json(s.store.get_series(&slug).await?))
 }
 
-pub async fn pause(State(s): State<AppState>, body: Bytes) -> ApiResult<ControlResponse> {
-    let req = parse_request(&body)?;
+pub async fn pause(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ControlResponse> {
+    let req = parse_request(&headers, &body)?;
     send_control(&s, ControlCommand::Pause { reason: req.reason }).await
 }
 
-pub async fn resume(State(s): State<AppState>, body: Bytes) -> ApiResult<ControlResponse> {
-    let req = parse_request(&body)?;
+pub async fn resume(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ControlResponse> {
+    let req = parse_request(&headers, &body)?;
     send_control(
         &s,
         ControlCommand::Resume {
@@ -121,13 +131,39 @@ pub async fn resume(State(s): State<AppState>, body: Bytes) -> ApiResult<Control
     .await
 }
 
-pub async fn kill(State(s): State<AppState>, body: Bytes) -> ApiResult<ControlResponse> {
-    let req = parse_request(&body)?;
+pub async fn kill(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ControlResponse> {
+    let req = parse_request(&headers, &body)?;
     send_control(&s, ControlCommand::Kill { reason: req.reason }).await
 }
 
-/// The body is optional: an empty body means no reason and no acknowledgement.
-fn parse_request(body: &[u8]) -> Result<ControlRequest, ApiError> {
+/// Control endpoints gate real-money trading and the dashboard has no auth while local, so a
+/// cross-origin page must not be able to trigger them with a CORS "simple request" (for example
+/// `text/plain`, which the browser sends without a preflight). Requiring `application/json` on
+/// every POST, empty body included, forces a preflight, which the CORS layer denies for any origin
+/// but the dashboard's.
+fn require_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(ApiError::UnsupportedMediaType(
+            "Content-Type must be application/json".into(),
+        ))
+    }
+}
+
+/// The body is optional: an empty body means no reason and no acknowledgement. The
+/// `Content-Type: application/json` header is not optional.
+fn parse_request(headers: &HeaderMap, body: &[u8]) -> Result<ControlRequest, ApiError> {
+    require_json_content_type(headers)?;
     if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(ControlRequest {
             reason: None,
