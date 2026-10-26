@@ -1,1 +1,404 @@
-// implemented in Task 7
+//! Store tests against a real Postgres 17 (testcontainers; Docker must be running).
+//!
+//! One container serves the whole file. Every test gets its own freshly created database so
+//! counts and ordering never depend on test interleaving.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use raki_core::{Asset, Outcome, SeriesRow, Source, TradingMode, WindowRecord, WindowStatus};
+use raki_store::Store;
+use rust_decimal::Decimal;
+use sqlx::Row;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use tokio::sync::OnceCell;
+use uuid::Uuid;
+
+/// Exact decimal from a literal; never goes through f64.
+fn dec(s: &str) -> Decimal {
+    s.parse().unwrap()
+}
+
+struct Pg {
+    // Held so the container lives for the whole test binary.
+    _container: ContainerAsync<Postgres>,
+    admin_url: String,
+    base_url: String,
+}
+
+static PG: OnceCell<Pg> = OnceCell::const_new();
+static DB_SEQ: AtomicU32 = AtomicU32::new(0);
+
+async fn pg() -> &'static Pg {
+    PG.get_or_init(|| async {
+        let container = Postgres::default()
+            .with_tag("17-alpine")
+            .start()
+            .await
+            .expect("start postgres container (is Docker running?)");
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let base_url = format!("postgres://postgres:postgres@127.0.0.1:{port}");
+        Pg {
+            admin_url: format!("{base_url}/postgres"),
+            base_url,
+            _container: container,
+        }
+    })
+    .await
+}
+
+/// A store on a brand-new, migrated database.
+async fn fresh_store() -> Store {
+    let pg = pg().await;
+    let name = format!(
+        "t{}_{}",
+        std::process::id(),
+        DB_SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let admin = Store::connect(&pg.admin_url).await.unwrap();
+    // Test-only: `name` is generated here, never user input.
+    sqlx::query(sqlx::AssertSqlSafe(format!("create database {name}")))
+        .execute(&admin.pool)
+        .await
+        .unwrap();
+    Store::connect(&format!("{}/{name}", pg.base_url))
+        .await
+        .unwrap()
+}
+
+fn window(slug: &str, asset: Asset, start_ts: i64, session: Uuid) -> WindowRecord {
+    WindowRecord {
+        slug: slug.into(),
+        asset,
+        start_ts,
+        end_ts: start_ts + 300,
+        event_id: Some("ev1".into()),
+        condition_id: Some("0xcond".into()),
+        up_token: Some("up".into()),
+        down_token: Some("down".into()),
+        price_to_beat_ours: Some(100.5),
+        final_twap_ours: None,
+        outcome_ours: None,
+        price_to_beat_gamma: None,
+        final_price_gamma: None,
+        twap_match: None,
+        winner: None,
+        resolved_at: None,
+        resolution_seen_ms: None,
+        twap_source: None,
+        coverage_secs: 10,
+        status: WindowStatus::Live,
+        session_id: session.to_string(),
+        updated_ms: 1_000,
+    }
+}
+
+fn row(slug: &str, ts: i64, up_bid: Option<Decimal>) -> SeriesRow {
+    SeriesRow {
+        slug: slug.into(),
+        ts,
+        twap: Some(100.0 + ts as f64),
+        chainlink: Some(1.0),
+        binance_mid_usd: None,
+        coinbase_mid: Some(2.5),
+        up_bid,
+        up_ask: Some(dec("0.5")),
+        down_bid: None,
+        down_ask: Some(dec("0.01")),
+    }
+}
+
+#[tokio::test]
+async fn migrations_apply() {
+    let store = fresh_store().await;
+    for q in [
+        "select count(*) from sessions",
+        "select count(*) from windows",
+        "select count(*) from window_series",
+        "select count(*) from feed_gaps",
+        "select count(*) from control_audit",
+    ] {
+        let n: i64 = sqlx::query(q)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+            .get(0);
+        assert_eq!(n, 0);
+    }
+    // Reconnecting re-runs migrate!() and must be a no-op.
+    let again = Store::connect(&format!(
+        "{}/{}",
+        pg().await.base_url,
+        sqlx::query("select current_database()")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get::<String, _>(0)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(again.recording_stats().await.unwrap().windows_total, 0);
+}
+
+#[tokio::test]
+async fn upsert_window_roundtrip_and_update() {
+    let store = fresh_store().await;
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+    store
+        .start_session(first, 1, "0.1.0", "host")
+        .await
+        .unwrap();
+    store
+        .start_session(second, 2, "0.1.0", "host")
+        .await
+        .unwrap();
+
+    let mut w = window("btc-updown-5m-1000", Asset::Btc, 1000, first);
+    store.upsert_window(&w).await.unwrap();
+    assert_eq!(store.get_window(&w.slug).await.unwrap(), Some(w.clone()));
+
+    // Later update from another session, with a lower coverage counter (restart mid-window).
+    w.winner = Some(Outcome::Up);
+    w.outcome_ours = Some(Outcome::Down);
+    w.final_twap_ours = Some(101.25);
+    w.twap_match = Some(false);
+    w.twap_source = Some(Source::Polybolt);
+    w.resolved_at = Some(1_300);
+    w.resolution_seen_ms = Some(1_301_000);
+    w.status = WindowStatus::Complete;
+    w.updated_ms = 2_000;
+    w.coverage_secs = 4;
+    w.session_id = second.to_string();
+    store.upsert_window(&w).await.unwrap();
+
+    let got = store.get_window(&w.slug).await.unwrap().unwrap();
+    assert_eq!(got.winner, Some(Outcome::Up));
+    assert_eq!(got.outcome_ours, Some(Outcome::Down));
+    assert_eq!(got.twap_source, Some(Source::Polybolt));
+    assert_eq!(got.status, WindowStatus::Complete);
+    assert_eq!(got.final_twap_ours, Some(101.25));
+    assert_eq!(got.twap_match, Some(false));
+    assert_eq!(got.session_id, first.to_string(), "first session is kept");
+    assert_eq!(got.coverage_secs, 10, "max coverage is kept");
+
+    // A higher counter wins.
+    w.coverage_secs = 250;
+    store.upsert_window(&w).await.unwrap();
+    assert_eq!(
+        store
+            .get_window(&w.slug)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage_secs,
+        250
+    );
+
+    assert_eq!(store.get_window("nope").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn series_insert_idempotent() {
+    let store = fresh_store().await;
+    let rows = vec![
+        row("s", 3, Some(dec("0.995"))),
+        row("s", 1, Some(dec("0.005"))),
+        row("s", 2, None),
+    ];
+    store.insert_series(&rows).await.unwrap();
+    store.insert_series(&rows).await.unwrap();
+    store.insert_series(&[]).await.unwrap();
+
+    let got = store.get_series("s").await.unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got.iter().map(|r| r.ts).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(got[2].up_bid, Some(dec("0.995")));
+    assert_eq!(got[0].up_bid, Some(dec("0.005")));
+    assert_eq!(got[1].up_bid, None);
+    assert_eq!(got[0], rows[1]);
+    assert!(store.get_series("other").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_windows_filters_and_orders() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1, "v", "h").await.unwrap();
+    for (slug, asset, start) in [
+        ("btc-a", Asset::Btc, 100),
+        ("eth-a", Asset::Eth, 200),
+        ("btc-b", Asset::Btc, 300),
+        ("sol-a", Asset::Sol, 400),
+        ("btc-c", Asset::Btc, 500),
+    ] {
+        store
+            .upsert_window(&window(slug, asset, start, s))
+            .await
+            .unwrap();
+    }
+
+    let all = store.list_windows(None, 100, None).await.unwrap();
+    assert_eq!(
+        all.iter().map(|w| w.slug.as_str()).collect::<Vec<_>>(),
+        ["btc-c", "sol-a", "btc-b", "eth-a", "btc-a"]
+    );
+
+    let btc = store
+        .list_windows(Some(Asset::Btc), 100, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        btc.iter().map(|w| w.slug.as_str()).collect::<Vec<_>>(),
+        ["btc-c", "btc-b", "btc-a"]
+    );
+
+    let limited = store.list_windows(Some(Asset::Btc), 2, None).await.unwrap();
+    assert_eq!(limited.len(), 2);
+
+    // `before_start` is an exclusive cursor on start_ts.
+    let page = store
+        .list_windows(Some(Asset::Btc), 100, Some(500))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|w| w.slug.as_str()).collect::<Vec<_>>(),
+        ["btc-b", "btc-a"]
+    );
+    let page = store.list_windows(None, 1, Some(300)).await.unwrap();
+    assert_eq!(page[0].slug, "eth-a");
+}
+
+#[tokio::test]
+async fn recording_stats_counts() {
+    let store = fresh_store().await;
+    let empty = store.recording_stats().await.unwrap();
+    assert_eq!(
+        (empty.sessions, empty.recorded_secs, empty.windows_total),
+        (0, 0, 0)
+    );
+    assert_eq!(empty.gate_target_windows, 500);
+
+    let s1 = Uuid::now_v7();
+    let s2 = Uuid::now_v7();
+    store.start_session(s1, 1_000, "v", "h").await.unwrap();
+    store.end_session(s1, 61_000, "shutdown").await.unwrap();
+    store
+        .start_session(s2, raki_core::now_ms(), "v", "h")
+        .await
+        .unwrap();
+
+    let mut matched = window("m", Asset::Btc, 100, s1);
+    matched.final_twap_ours = Some(1.0);
+    matched.twap_match = Some(true);
+    let mut mismatched = window("x", Asset::Eth, 200, s1);
+    mismatched.final_twap_ours = Some(2.0);
+    mismatched.twap_match = Some(false);
+    let mut pending = window("p", Asset::Sol, 300, s1);
+    pending.final_twap_ours = Some(3.0);
+    for w in [&matched, &mismatched, &pending] {
+        store.upsert_window(w).await.unwrap();
+    }
+    // A window with no TWAP at all counts only toward the total.
+    store
+        .upsert_window(&window("n", Asset::Btc, 400, s1))
+        .await
+        .unwrap();
+
+    let st = store.recording_stats().await.unwrap();
+    assert_eq!(st.sessions, 2);
+    assert!(st.recorded_secs >= 60, "got {}", st.recorded_secs);
+    assert_eq!(st.windows_total, 4);
+    assert_eq!(st.windows_with_twap, 3);
+    assert_eq!(st.twap_match, 1);
+    assert_eq!(st.twap_mismatch, 1);
+    assert_eq!(st.twap_pending, 1);
+    assert_eq!(st.gate_target_windows, 500);
+}
+
+#[tokio::test]
+async fn audit_and_gap_insert() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1, "v", "h").await.unwrap();
+
+    store
+        .insert_gap(s, Source::ClobMarket, 5_000, "ws closed")
+        .await
+        .unwrap();
+    store
+        .insert_audit(
+            6_000,
+            "pause",
+            true,
+            TradingMode::Running,
+            TradingMode::Paused,
+            Some("manual"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .insert_audit(
+            7_000,
+            "resume",
+            false,
+            TradingMode::Paused,
+            TradingMode::Paused,
+            None,
+            Some("safety checks failing"),
+        )
+        .await
+        .unwrap();
+
+    let gap = sqlx::query("select source, at_ms, reason, session_id from feed_gaps")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(gap.get::<String, _>("source"), "clob_market");
+    assert_eq!(gap.get::<i64, _>("at_ms"), 5_000);
+    assert_eq!(gap.get::<String, _>("reason"), "ws closed");
+    assert_eq!(gap.get::<Uuid, _>("session_id"), s);
+
+    let audits = sqlx::query(
+        "select action, ok, from_mode, to_mode, reason, error from control_audit order by id",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].get::<String, _>("from_mode"), "running");
+    assert_eq!(audits[0].get::<String, _>("to_mode"), "paused");
+    assert_eq!(
+        audits[0].get::<Option<String>, _>("reason").as_deref(),
+        Some("manual")
+    );
+    assert!(audits[0].get::<bool, _>("ok"));
+    assert!(!audits[1].get::<bool, _>("ok"));
+    assert_eq!(audits[1].get::<Option<String>, _>("reason"), None);
+    assert_eq!(
+        audits[1].get::<Option<String>, _>("error").as_deref(),
+        Some("safety checks failing")
+    );
+}
+
+#[tokio::test]
+async fn session_end_is_recorded() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1_000, "0.1.0", "box").await.unwrap();
+    store.end_session(s, 9_000, "shutdown").await.unwrap();
+    let r = sqlx::query("select ended_ms, end_reason, version, host from sessions where id = $1")
+        .bind(s)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(r.get::<Option<i64>, _>("ended_ms"), Some(9_000));
+    assert_eq!(
+        r.get::<Option<String>, _>("end_reason").as_deref(),
+        Some("shutdown")
+    );
+    assert_eq!(r.get::<String, _>("version"), "0.1.0");
+    assert_eq!(r.get::<String, _>("host"), "box");
+}
