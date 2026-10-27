@@ -1,8 +1,5 @@
 //! Health monitors: clock offset, machine sleep, geoblock, and the safety roll-up.
 
-// Nothing calls these until Task 10 wires the monitors into `main`.
-#![allow(dead_code)]
-
 pub mod clock;
 pub mod geoblock;
 pub mod sleep;
@@ -18,7 +15,6 @@ struct Inner {
     clock: ClockStatus,
     geo: GeoStatus,
     sleep_events: u32,
-    last_sleep_ms: Option<i64>,
 }
 
 /// Latest results of the monitors. Written by the monitor tasks, read by the health snapshot.
@@ -42,7 +38,6 @@ impl HealthState {
                     checked_ms: None,
                 },
                 sleep_events: 0,
-                last_sleep_ms: None,
             }),
         })
     }
@@ -63,11 +58,6 @@ impl HealthState {
         self.lock().sleep_events
     }
 
-    /// Epoch ms of the most recent detected sleep.
-    pub fn last_sleep_ms(&self) -> Option<i64> {
-        self.lock().last_sleep_ms
-    }
-
     /// Stores a clock check. `None` means no server answered: the offset is unknown, hence not ok.
     pub(crate) fn set_clock_offset(&self, offset_ms: Option<f64>) {
         let mut g = self.lock();
@@ -86,9 +76,7 @@ impl HealthState {
     }
 
     pub(crate) fn record_sleep(&self) {
-        let mut g = self.lock();
-        g.sleep_events += 1;
-        g.last_sleep_ms = Some(now_ms());
+        self.lock().sleep_events += 1;
     }
 }
 
@@ -337,6 +325,5 @@ mod tests {
         assert_eq!(st.geo().blocked, Some(true));
         st.record_sleep();
         assert_eq!(st.sleep_events(), 1);
-        assert!(st.last_sleep_ms().is_some());
     }
 }
