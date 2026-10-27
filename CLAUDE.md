@@ -301,7 +301,16 @@ Polymarket changed fees three times in 2026. It also changed the taker delay (25
 - Window maths, TWAP estimation, the tie rule, fee rounding, the fill simulator and risk limits are **test-first, with deterministic replay tests**. These are where a silent bug costs money.
 - Money and prices use `Decimal` and timestamps are UTC. Store the source and receive timestamps separately.
 - Keep strategy code free of I/O so it runs the same in replay, paper and live.
-- Commands (build, test, run) will be listed here once the project is scaffolded.
+- **Commands.** Run from the repo root unless noted. `README.md` ("Run M1 locally") has the details.
+  - Run everything: `make dev` (Postgres, then traderd and the dashboard; Ctrl-C stops both, `make db-down` stops Postgres).
+  - One at a time: `make db-up`, `make backend-run` (API on `127.0.0.1:8787`), `make frontend-dev` (dashboard on `http://localhost:3000`).
+  - Build: `cargo build --release --manifest-path backend/Cargo.toml`; `cd frontend && pnpm build`.
+  - Test everything: `make test` (backend `cargo test --workspace` plus frontend `vitest run`).
+  - Backend only: `make backend-test`; lint with `cd backend && cargo clippy --workspace --all-targets -- -D warnings`.
+  - Frontend only (in `frontend/`): `pnpm test`, `pnpm typecheck`, `pnpm build`.
+  - End-to-end smoke (needs `make dev` running; first time `pnpm exec playwright install chromium`): `cd frontend && pnpm e2e`. It pauses trading and attempts a resume against the live backend, never Kill.
+  - Regenerate the dashboard's API types after changing Rust DTOs: `cd backend && cargo test -p raki-core export_bindings` (writes `frontend/src/api/generated/`, never hand-edit it).
+  - Inspect a raw file: `cargo run --release --manifest-path backend/Cargo.toml -p traderd --bin rawcat -- data/raw/<day>/<file>.ndjson.zst`.
 
 ---
 
