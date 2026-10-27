@@ -101,6 +101,25 @@ function listPath(asset: Asset | null, before: number | null): string {
   return `/api/windows?${q.toString()}`
 }
 
+/**
+ * Cursor for the next page. The backend `before` is an exclusive bound on `start_ts`.
+ * With asset=all up to three rows share a `start_ts`, so a page boundary can split that group;
+ * `before = last.start_ts` would then skip the rest of the group. For the all-assets view we
+ * step one second past the last `start_ts`, so the whole group is fetched again (slug dedupe
+ * drops the repeats). If the page was made of one `start_ts` group only, that would not move
+ * the cursor back, so fall back to the exact `start_ts` to guarantee progress.
+ */
+export function nextBefore(
+  asset: Asset | null,
+  last: WindowRecord[],
+  lastParam: number | null,
+): number {
+  const ts = last[last.length - 1].start_ts
+  if (asset !== null) return ts
+  const inclusive = ts + 1
+  return lastParam !== null && inclusive >= lastParam ? ts : inclusive
+}
+
 type Props = {
   asset: Asset | null
   onAssetChange: (asset: Asset | null) => void
@@ -111,9 +130,9 @@ export function WindowsPage({ asset, onAssetChange }: Props) {
     queryKey: qk.windows(asset, null),
     queryFn: ({ pageParam }) => getJson<WindowRecord[]>(listPath(asset, pageParam)),
     initialPageParam: null as number | null,
-    // A short page is the last one. Otherwise continue strictly before the oldest row we have.
-    getNextPageParam: (last) =>
-      last.length < PAGE_SIZE ? undefined : last[last.length - 1].start_ts,
+    // A short page is the last one.
+    getNextPageParam: (last, _pages, lastParam) =>
+      last.length < PAGE_SIZE ? undefined : nextBefore(asset, last, lastParam),
     staleTime: 15_000,
     refetchOnWindowFocus: false,
   })
