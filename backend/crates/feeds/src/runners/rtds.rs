@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use raki_core::{Asset, Source};
+use raki_core::Source;
 use serde::Serialize;
 
 use super::{End, FeedCtx, Incoming, Link, Session, default_backoff, heartbeat, run_session};
@@ -26,18 +26,13 @@ impl Default for RtdsTiming {
     }
 }
 
-pub async fn run_rtds_legacy(ctx: FeedCtx, url: String, assets: Vec<Asset>) {
-    run_rtds_legacy_with(ctx, url, assets, default_backoff(), RtdsTiming::default()).await;
+/// Subscribes to every symbol: the parser keeps only the tracked assets.
+pub async fn run_rtds_legacy(ctx: FeedCtx, url: String) {
+    run_rtds_legacy_with(ctx, url, default_backoff(), RtdsTiming::default()).await;
 }
 
-pub async fn run_rtds_legacy_with(
-    ctx: FeedCtx,
-    url: String,
-    assets: Vec<Asset>,
-    backoff: Backoff,
-    timing: RtdsTiming,
-) {
-    let subscribe = subscribe_frame(&assets);
+pub async fn run_rtds_legacy_with(ctx: FeedCtx, url: String, backoff: Backoff, timing: RtdsTiming) {
+    let subscribe = subscribe_frame();
     let rtds = Rtds {
         url,
         subscribe,
@@ -63,23 +58,23 @@ struct Subscription {
     topic: &'static str,
     #[serde(rename = "type")]
     kind: &'static str,
-    /// A JSON-encoded string, e.g. `{"symbol":"btc/usd"}`.
+    /// A JSON-encoded string such as `{"symbol":"btc/usd"}`; empty means every symbol.
     filters: String,
 }
 
-/// The TWAP and Chainlink topics for every asset, in one frame.
-fn subscribe_frame(assets: &[Asset]) -> String {
-    let subscriptions = assets
-        .iter()
-        .flat_map(|a| {
-            let filters = serde_json::json!({ "symbol": a.rtds_symbol() }).to_string();
-            ["crypto_prices_twap_sixty", "crypto_prices_chainlink"].map(|topic| Subscription {
-                topic,
-                kind: "*",
-                filters: filters.clone(),
-            })
+/// The TWAP and Chainlink topics for all symbols, in one frame.
+///
+/// Live (2026-10-26): with one `{"symbol":..}` filter per asset, the server sends a snapshot for
+/// each symbol but streams updates only for the first symbol of each topic. An empty filter
+/// streams all 8 symbols (about 1 update per second per symbol and topic).
+fn subscribe_frame() -> String {
+    let subscriptions = ["crypto_prices_twap_sixty", "crypto_prices_chainlink"]
+        .map(|topic| Subscription {
+            topic,
+            kind: "*",
+            filters: String::new(),
         })
-        .collect();
+        .into();
     let frame = Subscribe {
         action: "subscribe",
         subscriptions,

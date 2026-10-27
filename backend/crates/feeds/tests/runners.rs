@@ -607,13 +607,12 @@ async fn polybolt_seq_gap_is_recorded() {
 }
 
 #[tokio::test]
-async fn rtds_subscribes_per_asset_and_pings() {
+async fn rtds_subscribes_all_symbols_per_topic_and_pings() {
     let (ctx, h) = harness();
     let srv = server().await;
     let runner = tokio::spawn(run_rtds_legacy_with(
         ctx,
         srv.url.clone(),
-        vec![Asset::Btc, Asset::Sol],
         fast_backoff(),
         RtdsTiming {
             ping: ms(50),
@@ -624,17 +623,16 @@ async fn rtds_subscribes_per_asset_and_pings() {
     let mut ws = srv.accept().await;
     let sub = next_json(&mut ws).await;
     assert_eq!(sub["action"], "subscribe");
-    let subs = sub["subscriptions"].as_array().unwrap();
-    assert_eq!(subs.len(), 4);
-    for symbol in ["btc/usd", "sol/usd"] {
-        let filters = json!({ "symbol": symbol }).to_string();
-        for topic in ["crypto_prices_twap_sixty", "crypto_prices_chainlink"] {
-            assert!(
-                subs.contains(&json!({"topic": topic, "type": "*", "filters": filters})),
-                "missing {topic} {symbol} in {sub}"
-            );
-        }
-    }
+    // Live: with one `{"symbol":..}` filter per asset, the server streams updates only for the
+    // first symbol of each topic (the others get just a snapshot). An empty filter streams all
+    // symbols; the parser drops the ones we do not track.
+    assert_eq!(
+        sub["subscriptions"],
+        json!([
+            {"topic": "crypto_prices_twap_sixty", "type": "*", "filters": ""},
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""},
+        ])
+    );
     assert_eq!(next_text(&mut ws).await, "ping");
 
     h.stop(runner).await;
@@ -647,7 +645,6 @@ async fn rtds_reconnects_when_stale() {
     let runner = tokio::spawn(run_rtds_legacy_with(
         ctx,
         srv.url.clone(),
-        vec![Asset::Btc],
         fast_backoff(),
         RtdsTiming {
             stale_after: ms(150),
@@ -794,7 +791,6 @@ async fn live_feeds_smoke() {
         tokio::spawn(run_rtds_legacy(
             ctx(),
             "wss://ws-live-data.polymarket.com".into(),
-            assets.clone(),
         )),
         tokio::spawn(run_binance(
             ctx(),
