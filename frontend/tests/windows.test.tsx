@@ -11,7 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SeriesRow } from '../src/api/generated/SeriesRow'
 import type { WindowRecord } from '../src/api/generated/WindowRecord'
-import { toChartPoints, toQuotePoints } from '../src/components/WindowChart'
+import { priceTicks, toChartPoints, toQuotePoints } from '../src/components/WindowChart'
+import { fmtPrice } from '../src/components/fmt'
 import { MatchBadge, nextBefore, WindowsPage } from '../src/routes/windows.index'
 import { WindowDetailPage } from '../src/routes/windows.$slug'
 
@@ -288,6 +289,33 @@ describe('WindowChart data', () => {
       START,
     )
     expect(pts.map((p) => p.x)).toEqual([0, 300])
+  })
+
+  it('price ticks are distinct for SOL, ETH and BTC sized ranges', () => {
+    const labels = (domain: [number, number]) => {
+      const { ticks, digits } = priceTicks(domain)
+      return ticks.map((t) => fmtPrice(t, digits))
+    }
+    // A SOL window spans ~0.2 USD: whole-dollar labels all read "100".
+    const sol = labels([99.765, 99.985])
+    expect(sol.length).toBeGreaterThanOrEqual(3)
+    expect(new Set(sol).size).toBe(sol.length)
+    expect(sol).toEqual(['99.80', '99.85', '99.90', '99.95'])
+    // An ETH window spans a few USD.
+    const eth = labels([2308.4, 2312.6])
+    expect(new Set(eth).size).toBe(eth.length)
+    expect(eth).toEqual(['2,309', '2,310', '2,311', '2,312'])
+    // A BTC window spans ~100 USD: whole dollars.
+    const { ticks, digits } = priceTicks([80_010, 80_185])
+    expect(digits).toBe(0)
+    expect(ticks).toEqual([80_050, 80_100, 80_150])
+    // Every tick lies inside the domain.
+    for (const [lo, hi] of [[99.765, 99.985], [2308.4, 2312.6], [0.123, 0.124]] as const) {
+      for (const t of priceTicks([lo, hi]).ticks) {
+        expect(t).toBeGreaterThanOrEqual(lo)
+        expect(t).toBeLessThanOrEqual(hi)
+      }
+    }
   })
 
   it('quotes convert decimal strings to cents', () => {

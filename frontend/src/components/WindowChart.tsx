@@ -102,6 +102,36 @@ function priceDomain(points: readonly ChartPoint[], ref: number | null): [number
   return [lo - pad, hi + pad]
 }
 
+/** Decimals needed to print `step` exactly (0.25 → 2, 0.5 → 1, 5 → 0), at most 6. */
+function decimalsOf(step: number): number {
+  for (let d = 0; d < 6; d++) {
+    const x = step * 10 ** d
+    if (Math.abs(x - Math.round(x)) < 1e-6) return d
+  }
+  return 6
+}
+
+/**
+ * "Nice" y ticks (steps of 1, 2, 2.5 or 5 × 10^k) inside `domain`, and the decimals that print
+ * each one exactly. A SOL window spans ~0.2 USD and an ETH one a few USD: whole-dollar labels
+ * would all read the same.
+ */
+export function priceTicks(domain: [number, number], count = 5): { ticks: number[]; digits: number } {
+  const [lo, hi] = domain
+  const span = hi - lo
+  if (!Number.isFinite(span) || span <= 0) return { ticks: [lo], digits: 2 }
+  // About `count` ticks: the step is the smallest nice value at least span / count.
+  const raw = span / count
+  const mag = 10 ** Math.floor(Math.log10(raw))
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw * (1 - 1e-9)) ?? 10 * mag
+  const digits = decimalsOf(step)
+  const ticks: number[] = []
+  for (let i = Math.ceil(lo / step - 1e-9); i * step <= hi + step * 1e-9; i++) {
+    ticks.push(Number((i * step).toFixed(digits)))
+  }
+  return { ticks, digits }
+}
+
 const tooltipStyle = {
   background: 'var(--surface)',
   border: '1px solid var(--border)',
@@ -125,6 +155,7 @@ export function WindowChart({ series, startTs, priceToBeat }: Props) {
   const points = toChartPoints(series, startTs)
   const quotes = toQuotePoints(series, startTs) // same filter as points, so index i lines up
   const domain = priceDomain(points, priceToBeat)
+  const yTicks = priceTicks(domain)
 
   return (
     <div className="charts">
@@ -144,8 +175,9 @@ export function WindowChart({ series, startTs, priceToBeat }: Props) {
             <YAxis
               type="number"
               domain={domain}
-              tickFormatter={(v: number) => fmtPrice(v, 0)}
-              width={64}
+              ticks={yTicks.ticks}
+              tickFormatter={(v: number) => fmtPrice(v, yTicks.digits)}
+              width={Math.max(64, 8 * (8 + yTicks.digits))}
               {...AXIS}
             />
             <Tooltip
