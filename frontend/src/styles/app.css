@@ -1,4 +1,53 @@
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #d9dde3;
+  --text: #1a1d23;
+  --text-muted: #5b6472;
+  --accent: #2563eb;
+  --ok: #15803d;
+  --ok-bg: #dcfce7;
+  --warn: #a16207;
+  --warn-bg: #fef3c7;
+  --bad: #b91c1c;
+  --bad-bg: #fee2e2;
+  --idle: #4b5563;
+  --idle-bg: #e5e7eb;
+  --banner-bg: #b91c1c;
+  --banner-text: #ffffff;
+  /* chart series */
+  --series-twap: #2563eb;
+  --series-chainlink: #7c3aed;
+  --series-binance: #d97706;
+  --series-coinbase: #0891b2;
+  --series-ref: #6b7280;
+  color-scheme: light dark;
+}
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --surface: #171b21;
+    --border: #2b323c;
+    --text: #e6e9ee;
+    --text-muted: #9aa4b2;
+    --accent: #60a5fa;
+    --ok: #4ade80;
+    --ok-bg: #12301d;
+    --warn: #fbbf24;
+    --warn-bg: #3a2c0a;
+    --bad: #f87171;
+    --bad-bg: #3b1414;
+    --idle: #9ca3af;
+    --idle-bg: #262c35;
+    --banner-bg: #991b1b;
+    --series-twap: #60a5fa;
+    --series-chainlink: #a78bfa;
+    --series-binance: #fbbf24;
+    --series-coinbase: #22d3ee;
+    --series-ref: #9ca3af;
+  }
+}
 
 * {
   box-sizing: border-box;
@@ -6,11 +55,116 @@
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
   font-family: system-ui, sans-serif;
+  line-height: 1.4;
 }
 
-main {
-  width: min(42rem, calc(100% - 2rem));
-  margin: 4rem auto;
+a {
+  color: var(--accent);
 }
 
+.shell {
+  min-height: 100vh;
+}
+
+.banner {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  text-align: center;
+  font-weight: 600;
+}
+
+.banner-bad {
+  background: var(--banner-bg);
+  color: var(--banner-text);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.6rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+}
+
+.topbar nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.topbar nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 0.2rem 0;
+  border-bottom: 2px solid transparent;
+}
+
+.topbar nav a:hover {
+  color: var(--text);
+}
+
+.topbar nav a.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.topbar-status {
+  margin-left: auto;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge-ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.badge-warn {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.badge-bad {
+  color: var(--bad);
+  background: var(--bad-bg);
+}
+
+.badge-idle {
+  color: var(--idle);
+  background: var(--idle-bg);
+}
+
+.content {
+  width: min(72rem, calc(100% - 2rem));
+  margin: 1.5rem auto;
+}
+
+/* The last snapshot stays visible while reconnecting, but greyed out. */
+.content.stale {
+  opacity: 0.55;
+  filter: grayscale(1);
+}
+
+@media (max-width: 40rem) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+}
