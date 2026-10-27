@@ -308,7 +308,7 @@ Polymarket changed fees three times in 2026. It also changed the taker delay (25
   - Test everything: `make test` (backend `cargo test --workspace` plus frontend `vitest run`).
   - Backend only: `make backend-test`; lint with `cd backend && cargo clippy --workspace --all-targets -- -D warnings`.
   - Frontend only (in `frontend/`): `pnpm test`, `pnpm typecheck`, `pnpm build`.
-  - End-to-end smoke (needs `make dev` running; first time `pnpm exec playwright install chromium`): `cd frontend && pnpm e2e`. It pauses trading and attempts a resume against the live backend, never Kill.
+  - End-to-end smoke (needs `make dev` running; first time `pnpm exec playwright install chromium`): `cd frontend && pnpm e2e`. Against the live backend it pauses and resumes a running bot, or tries to resume one the backend stopped itself (safety or startup); it never resumes a manual pause or a Kill, never acknowledges a stop reason, and never clicks Kill.
   - Regenerate the dashboard's API types after changing Rust DTOs: `cd backend && cargo test -p raki-core export_bindings` (writes `frontend/src/api/generated/`, never hand-edit it).
   - Inspect a raw file: `cargo run --release --manifest-path backend/Cargo.toml -p traderd --bin rawcat -- data/raw/<day>/<file>.ndjson.zst`.
 

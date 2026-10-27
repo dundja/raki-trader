@@ -91,7 +91,9 @@ make test                        # backend (cargo test) and dashboard unit tests
 cd frontend && pnpm e2e          # Playwright smoke against the running stack (make dev first)
 ```
 
-The smoke test drives the real backend: it pauses trading and tries to resume it. It never
-clicks Kill. Before the first run, install the browser with
+The smoke test drives the real backend: if trading is running it pauses it and resumes it
+again. If the backend stopped trading on its own (a safety check or startup) it only tries to
+resume. It never resumes a manual pause or a Kill, never acknowledges a loss cap or config halt,
+and never clicks Kill. Before the first run, install the browser with
 `cd frontend && pnpm exec playwright install chromium`. Screenshots go to
 `frontend/e2e/screenshots/` (gitignored).

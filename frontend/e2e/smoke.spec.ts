@@ -6,7 +6,12 @@ import { expect, test, type Page } from '@playwright/test'
  * Smoke test against the REAL stack: the dev server on :3000 and a running traderd on :8787.
  * It reads live data, so assertions are about shape (cards, rows, labels), not values.
  * The only mutating calls are Pause and Resume through the UI; it never clicks Kill.
+ * It only resumes a bot it paused itself, or one the backend stopped on its own (safety, startup).
+ * A manual pause, a Kill, a loss cap or a config halt is the operator's decision and is left alone.
  */
+
+/** Stop kinds the backend sets by itself; resuming from these does not override the operator. */
+const AUTOMATIC_STOPS = new Set(['safety', 'startup'])
 
 async function screenshot(page: Page, name: string) {
   await page.screenshot({
@@ -62,7 +67,15 @@ test('pause then resume through the UI', async ({ page }) => {
   } else {
     // The safety loop can already have stopped trading (e.g. clock offset > 50 ms).
     await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeDisabled()
-    note('pause', `already ${initial}; Pause is disabled, nothing to click`)
+    const stopped = page.locator('.control-panel p').filter({ hasText: /^Stopped: / })
+    const stopKind = /^Stopped: (\S+)/.exec((await stopped.textContent()) ?? '')?.[1] ?? '—'
+    if (initial !== 'PAUSED' || !AUTOMATIC_STOPS.has(stopKind)) {
+      // A manual pause, a Kill (or a stop awaiting acknowledgement) is the operator's decision.
+      note('resume', `skipped: mode ${initial}, stopped: ${stopKind}; not resuming an operator stop`)
+      await screenshot(page, 'health-control')
+      return
+    }
+    note('pause', `already ${initial} (stopped: ${stopKind}); Pause is disabled, nothing to click`)
   }
 
   await page.getByRole('button', { name: 'Resume', exact: true }).click()
