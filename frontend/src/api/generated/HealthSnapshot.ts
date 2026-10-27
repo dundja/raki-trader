@@ -4,5 +4,6 @@ import type { FeedStatusDto } from "./FeedStatusDto";
 import type { GeoStatus } from "./GeoStatus";
 import type { RecorderStatus } from "./RecorderStatus";
 import type { SafetyChecks } from "./SafetyChecks";
+import type { StoreStatus } from "./StoreStatus";
 
-export type HealthSnapshot = { feeds: Array<FeedStatusDto>, clock: ClockStatus, geoblock: GeoStatus, recorder: RecorderStatus, sleep_events: number, book_resyncs: number, safety: SafetyChecks, };
+export type HealthSnapshot = { feeds: Array<FeedStatusDto>, clock: ClockStatus, geoblock: GeoStatus, recorder: RecorderStatus, store: StoreStatus, sleep_events: number, book_resyncs: number, safety: SafetyChecks, };

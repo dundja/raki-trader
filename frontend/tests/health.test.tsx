@@ -27,6 +27,8 @@ function feed(over: Partial<FeedStatusDto> = {}): FeedStatusDto {
     reconnects: 0,
     last_error: null,
     stale: false,
+    events_dropped: 0,
+    events_dropped_recent: 0,
     ...over,
   }
 }
@@ -77,6 +79,16 @@ describe('FeedTable', () => {
     expect(screen.getByTestId('feed-binance')).toHaveTextContent('1s ago')
     expect(screen.getByTestId('feed-binance')).toHaveTextContent('12.3')
   })
+
+  it('flags a feed whose events the engine is dropping', () => {
+    render(
+      <FeedTable
+        now={NOW}
+        feeds={[feed({ source: 'clob_market', events_dropped: 40, events_dropped_recent: 12 })]}
+      />,
+    )
+    expect(screen.getByTestId('feed-clob_market')).toHaveTextContent('DROPPING 12')
+  })
 })
 
 describe('SafetyPanel', () => {
@@ -88,6 +100,7 @@ describe('SafetyPanel', () => {
           clock_ok: false,
           geoblock_ok: true,
           recorder_ok: true,
+          store_ok: false,
           all_ok: false,
           reasons: ['clock offset 63.1 ms > 50 ms'],
         }}
@@ -95,37 +108,78 @@ describe('SafetyPanel', () => {
     )
     expect(screen.getByTestId('check-clock_ok')).toHaveTextContent('✗')
     expect(screen.getByTestId('check-feeds_fresh')).toHaveTextContent('✓')
+    expect(screen.getByTestId('check-store_ok')).toHaveTextContent('✗')
+    expect(screen.getByTestId('check-store_ok')).toHaveTextContent('Database writes')
     expect(screen.getByRole('list', { name: 'Reasons' })).toHaveTextContent(
       'clock offset 63.1 ms > 50 ms',
     )
+    expect(screen.getByTestId('safety-verdict')).toHaveTextContent('Checks failing')
+  })
+
+  it('says unknown, not "all checks pass", when the live data is stale', () => {
+    render(
+      <SafetyPanel
+        stale
+        safety={{
+          feeds_fresh: true,
+          clock_ok: true,
+          geoblock_ok: true,
+          recorder_ok: true,
+          store_ok: true,
+          all_ok: true,
+          reasons: [],
+        }}
+      />,
+    )
+    expect(screen.getByTestId('safety-verdict')).toHaveTextContent('Unknown: no live data')
+    expect(screen.queryByText('All checks pass')).toBeNull()
   })
 })
 
 describe('GateProgress', () => {
-  it('gate progress shows N / 500', () => {
-    render(
-      <GateProgress
-        stats={{
-          sessions: 3,
-          recorded_secs: 45_367,
-          windows_total: 330,
-          windows_with_twap: 181,
-          twap_match: 167,
-          twap_mismatch: 0,
-          twap_pending: 14,
-          gate_target_windows: 500,
-        }}
-      />,
-    )
+  const stats = {
+    sessions: 3,
+    recorded_secs: 45_367,
+    slept_secs: 18_000,
+    windows_total: 330,
+    windows_with_twap: 181,
+    twap_match: 167,
+    twap_mismatch: 0,
+    twap_awaiting: 6,
+    twap_unverified: 8,
+    gate_windows: 42,
+    gate_twap_match: 39,
+    gate_twap_mismatch: 1,
+    gate_twap_awaiting: 2,
+    gate_twap_unverified: 0,
+    gate_target_windows: 500,
+  }
+
+  it('gate progress counts only BTC windows with a PolyBolt TWAP', () => {
+    render(<GateProgress stats={stats} />)
     expect(
-      screen.getByText('M1 gate: 181 / 500 windows with TWAP'),
+      screen.getByText('M1 gate: 42 / 500 BTC windows with a PolyBolt TWAP'),
     ).toBeInTheDocument()
-    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '181')
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '42')
     expect(screen.getByTestId('twap-tally')).toHaveTextContent(
-      '167 match · 0 mismatch · 14 pending',
+      'Gate TWAP vs Gamma: 39 match · 1 mismatch · 2 awaiting · 0 unverified',
     )
-    expect(screen.getByTestId('recorded')).toHaveTextContent('12.6 h')
+    // All-asset, any-source numbers are shown apart and labelled as not the gate.
+    expect(screen.getByTestId('all-tally')).toHaveTextContent('not the gate')
+    expect(screen.getByTestId('all-tally')).toHaveTextContent(
+      '181 windows with TWAP · 167 match · 0 mismatch · 6 awaiting · 8 unverified',
+    )
+    expect(screen.getByTestId('recorded')).toHaveTextContent('12.6 h awake')
     expect(screen.getByTestId('recorded')).toHaveTextContent('3 sessions')
+    expect(screen.getByTestId('recorded')).toHaveTextContent('5.0 h asleep not counted')
+  })
+
+  it('an RTDS-only recording leaves the gate at zero', () => {
+    render(<GateProgress stats={{ ...stats, gate_windows: 0, gate_twap_match: 0 }} />)
+    expect(
+      screen.getByText('M1 gate: 0 / 500 BTC windows with a PolyBolt TWAP'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '0')
   })
 
   it('gate progress without stats shows placeholders', () => {

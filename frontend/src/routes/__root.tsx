@@ -11,6 +11,7 @@ import { useEffect, useState } from 'react'
 import { API_URL } from '../api/client'
 import type { TradingMode } from '../api/generated/TradingMode'
 import { LiveProvider, useLive, type LiveStatus } from '../api/useLive'
+import { useNow } from '../components/useNow'
 import appCss from '../styles/app.css?url'
 
 export const Route = createRootRoute({
@@ -92,9 +93,16 @@ const MODE_CLASS: Record<TradingMode, string> = {
   killed: 'badge-bad',
 }
 
+function silentFor(lastMessageMs: number | null): string {
+  if (lastMessageMs === null) return 'no data yet'
+  return `no data for ${Math.max(0, Math.floor((Date.now() - lastMessageMs) / 1000))}s`
+}
+
 /** Nav, connection badge, trading-mode pill and backend-unreachable banner around the page. */
 export function AppShell() {
-  const { snapshot, status } = useLive()
+  const { snapshot, status, stale: silent, lastMessageMs } = useLive()
+  // Re-render every second so the "no data for Ns" badge counts up.
+  useNow(1000)
   const [unreachable, setUnreachable] = useState(false)
 
   const waiting = status === 'reconnecting' && snapshot === null
@@ -108,8 +116,9 @@ export function AppShell() {
   }, [waiting])
 
   const mode = snapshot?.control.mode
-  // Keep the last snapshot on screen when the socket drops, but grey it out.
-  const stale = snapshot !== null && status !== 'open'
+  // Keep the last snapshot on screen when the socket drops or the frames stop, but grey it out.
+  const stale = snapshot !== null && (status !== 'open' || silent)
+  const silentOpen = status === 'open' && silent
 
   return (
     <div className="shell">
@@ -133,8 +142,11 @@ export function AppShell() {
           ))}
         </nav>
         <div className="topbar-status">
-          <span className={`badge ${STATUS_CLASS[status]}`}>
-            {STATUS_LABEL[status]}
+          <span
+            className={`badge ${silentOpen ? 'badge-warn' : STATUS_CLASS[status]}`}
+            data-testid="live-status"
+          >
+            {silentOpen ? silentFor(lastMessageMs) : STATUS_LABEL[status]}
           </span>
           {mode && (
             <span className={`badge ${MODE_CLASS[mode]}`}>

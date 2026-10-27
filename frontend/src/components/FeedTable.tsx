@@ -45,6 +45,14 @@ export function FeedTable({ feeds, now }: { feeds: FeedStatusDto[]; now: number 
               <td>
                 {state === 'stale' && <span className="badge badge-bad">STALE</span>}
                 {state === 'disabled' && <span className="muted">{disabledNote(f)}</span>}
+                {f.enabled && f.events_dropped_recent > 0 && (
+                  <span
+                    className="badge badge-bad"
+                    title={`${fmtInt(f.events_dropped_recent)} parsed events dropped in the last minute (the engine fell behind; raw frames are still recorded)`}
+                  >
+                    DROPPING {fmtInt(f.events_dropped_recent)}
+                  </span>
+                )}
               </td>
             </tr>
           )

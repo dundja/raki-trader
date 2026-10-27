@@ -183,6 +183,37 @@ describe('useLive', () => {
     expect(result.current.snapshot?.generated_ms).toBe(900)
   })
 
+  it('flags an open socket that stops delivering frames as stale', () => {
+    const { result } = renderHook(() => useLive(), { wrapper })
+    const ws = MockWebSocket.instances[0]
+    act(() => ws.open())
+    act(() => ws.push(snapshot()))
+    expect(result.current.stale).toBe(false)
+
+    // The backend pushes every second; 5 s of silence on an open socket means it stalled.
+    act(() => {
+      vi.advanceTimersByTime(5000)
+    })
+    expect(result.current.stale).toBe(false)
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    expect(result.current.status).toBe('open')
+    expect(result.current.stale).toBe(true)
+
+    act(() => ws.push(snapshot('running', 2000)))
+    expect(result.current.stale).toBe(false)
+  })
+
+  it('an open socket that never delivers a frame goes stale too', () => {
+    const { result } = renderHook(() => useLive(), { wrapper })
+    act(() => MockWebSocket.instances[0].open())
+    act(() => {
+      vi.advanceTimersByTime(6000)
+    })
+    expect(result.current.stale).toBe(true)
+  })
+
   it('useLive throws outside a LiveProvider', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
     expect(() => renderHook(() => useLive())).toThrow(/LiveProvider/)
@@ -240,6 +271,28 @@ describe('app shell', () => {
     expect(
       screen.getByText('Backend unreachable at http://127.0.0.1:8787'),
     ).toBeInTheDocument()
+  })
+
+  it('turns the live badge amber and greys the page when frames stop on an open socket', async () => {
+    await renderShell()
+    const ws = MockWebSocket.instances[0]
+    act(() => ws.open())
+    act(() => ws.push(snapshot('running')))
+    expect(screen.getByTestId('live-status')).toHaveTextContent('live')
+    expect(document.querySelector('main')).toHaveClass('content')
+    expect(document.querySelector('main')).not.toHaveClass('stale')
+
+    act(() => {
+      vi.advanceTimersByTime(7000)
+    })
+    const badge = screen.getByTestId('live-status')
+    expect(badge).toHaveTextContent(/^no data for [67]s$/)
+    expect(badge).toHaveClass('badge-warn')
+    expect(document.querySelector('main')).toHaveClass('stale')
+
+    act(() => ws.push(snapshot('running', 9000)))
+    expect(screen.getByTestId('live-status')).toHaveTextContent('live')
+    expect(document.querySelector('main')).not.toHaveClass('stale')
   })
 
   it('keeps the last snapshot, shows reconnecting, and no banner once a snapshot exists', async () => {

@@ -26,7 +26,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function HealthPage() {
-  const { snapshot } = useLive()
+  const { snapshot, status, stale } = useLive()
   const now = useNow(1000)
   const stats = useQuery({
     queryKey: qk.stats,
@@ -38,7 +38,7 @@ function HealthPage() {
     return <p className="muted">Waiting for data from the backend…</p>
   }
   const { health, control } = snapshot
-  const { clock, geoblock, recorder } = health
+  const { clock, geoblock, recorder, store } = health
 
   return (
     <div className="health">
@@ -46,7 +46,7 @@ function HealthPage() {
         <ControlPanel control={control} />
       </Section>
       <Section title="Safety checks">
-        <SafetyPanel safety={health.safety} />
+        <SafetyPanel safety={health.safety} stale={stale || status !== 'open'} />
       </Section>
       <Section title="Recording progress">
         <GateProgress stats={stats.data ?? null} />
@@ -97,6 +97,38 @@ function HealthPage() {
             <dt>Last flush</dt>
             <dd>{fmtAgo(recorder.last_flush_ms, now)}</dd>
           </div>
+        </dl>
+      </Section>
+      <Section title="Database">
+        <dl className="fields">
+          <div className="field">
+            <dt>Writes</dt>
+            <dd className={store.ok ? 'ok' : 'bad'} data-testid="store-writes">
+              {store.ok ? 'ok' : 'failing (retrying)'}
+            </dd>
+          </div>
+          <div className="field">
+            <dt>Pending</dt>
+            <dd className={store.pending_writes > 0 ? 'bad' : undefined}>
+              {fmtInt(store.pending_writes)}
+            </dd>
+          </div>
+          <div className="field">
+            <dt>Lost</dt>
+            <dd className={store.dropped_writes > 0 ? 'bad' : undefined}>
+              {fmtInt(store.dropped_writes)}
+            </dd>
+          </div>
+          <div className="field">
+            <dt>Last success</dt>
+            <dd>{fmtAgo(store.last_ok_ms, now)}</dd>
+          </div>
+          {store.last_error !== null && (
+            <div className="field">
+              <dt>Last error</dt>
+              <dd className="error-cell">{store.last_error}</dd>
+            </div>
+          )}
         </dl>
       </Section>
       <Section title="Counts">

@@ -8,4 +8,13 @@ import type { WindowStatus } from "./WindowStatus";
  * One tracked window, as stored in Postgres. `*_ours` values come from our own recording;
  * `*_gamma` values come from Polymarket's Gamma API.
  */
-export type WindowRecord = { slug: string, asset: Asset, start_ts: number, end_ts: number, event_id: string | null, condition_id: string | null, up_token: string | null, down_token: string | null, price_to_beat_ours: number | null, final_twap_ours: number | null, outcome_ours: Outcome | null, price_to_beat_gamma: number | null, final_price_gamma: number | null, twap_match: boolean | null, winner: Outcome | null, resolved_at: number | null, resolution_seen_ms: number | null, twap_source: Source | null, coverage_secs: number, status: WindowStatus, session_id: string, updated_ms: number, };
+export type WindowRecord = { slug: string, asset: Asset, start_ts: number, end_ts: number, event_id: string | null, condition_id: string | null, up_token: string | null, down_token: string | null, price_to_beat_ours: number | null, final_twap_ours: number | null, outcome_ours: Outcome | null, price_to_beat_gamma: number | null, final_price_gamma: number | null, twap_match: boolean | null, winner: Outcome | null, resolved_at: number | null, resolution_seen_ms: number | null, 
+/**
+ * Source of our price-to-beat point (the TWAP at the window start).
+ */
+twap_source: Source | null, 
+/**
+ * Source of our final TWAP point (the TWAP at the window end). The M1 gate counts BTC
+ * windows whose final point came from PolyBolt.
+ */
+final_twap_source: Source | null, coverage_secs: number, status: WindowStatus, session_id: string, updated_ms: number, };

@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
@@ -17,10 +18,18 @@ export type LiveValue = {
   status: LiveStatus
   /** Local receive time (epoch ms) of the last pushed frame. */
   lastMessageMs: number | null
+  /**
+   * The socket is open but no frame arrived for longer than {@link STALE_AFTER_MS}. The backend
+   * pushes every second, so this means its loop stalled: the snapshot on screen is old.
+   */
+  stale: boolean
 }
 
 const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 10_000
+/** An open socket with no frame for this long is stale (the backend pushes every 1 s). */
+export const STALE_AFTER_MS = 5000
+const STALE_CHECK_MS = 1000
 
 /** Delay before reconnect attempt number `attempt` (0-based): 1 s, 2 s, 4 s, 8 s, then 10 s. */
 export function backoffMs(attempt: number): number {
@@ -39,6 +48,24 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<LiveSnapshot | null>(null)
   const [status, setStatus] = useState<LiveStatus>('connecting')
   const [lastMessageMs, setLastMessageMs] = useState<number | null>(null)
+  const [stale, setStale] = useState(false)
+  /** Latest frame, or the socket's open time before its first frame. */
+  const lastSignOfLife = useRef<number | null>(null)
+
+  // The watchdog: an open socket alone does not mean the data is current.
+  useEffect(() => {
+    if (status !== 'open') {
+      setStale(false)
+      return
+    }
+    const check = () => {
+      const last = lastSignOfLife.current
+      setStale(last !== null && Date.now() - last > STALE_AFTER_MS)
+    }
+    check()
+    const id = setInterval(check, STALE_CHECK_MS)
+    return () => clearInterval(id)
+  }, [status])
 
   useEffect(() => {
     let disposed = false
@@ -63,6 +90,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       ws.onopen = () => {
         if (disposed) return
         attempt = 0
+        lastSignOfLife.current = Date.now()
         setStatus('open')
       }
       ws.onmessage = (ev: MessageEvent) => {
@@ -73,8 +101,11 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         } catch {
           return // ignore a malformed frame; the next one replaces it
         }
+        const at = Date.now()
+        lastSignOfLife.current = at
         setSnapshot((prev) => newer(prev, next))
-        setLastMessageMs(Date.now())
+        setLastMessageMs(at)
+        setStale(false)
       }
       ws.onerror = lose
       ws.onclose = lose
@@ -102,8 +133,8 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const value = useMemo(
-    () => ({ snapshot, status, lastMessageMs }),
-    [snapshot, status, lastMessageMs],
+    () => ({ snapshot, status, lastMessageMs, stale }),
+    [snapshot, status, lastMessageMs, stale],
   )
   return createElement(LiveContext.Provider, { value }, children)
 }

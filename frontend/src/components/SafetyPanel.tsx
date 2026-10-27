@@ -5,14 +5,23 @@ const CHECKS: ReadonlyArray<{ key: keyof Omit<SafetyChecks, 'all_ok' | 'reasons'
   { key: 'clock_ok', label: 'Clock offset within limit' },
   { key: 'geoblock_ok', label: 'Not geoblocked' },
   { key: 'recorder_ok', label: 'Recorder healthy' },
+  { key: 'store_ok', label: 'Database writes succeeding' },
 ]
 
-/** Hard safety checks the backend enforces before a resume, each with a mark and the reasons. */
-export function SafetyPanel({ safety }: { safety: SafetyChecks }) {
+/**
+ * Hard safety checks the backend enforces before a resume, each with a mark and the reasons.
+ * `stale`: the live data stopped arriving, so these results are old and say nothing about now.
+ */
+export function SafetyPanel({ safety, stale = false }: { safety: SafetyChecks; stale?: boolean }) {
+  const [cls, text] = stale
+    ? ['badge badge-warn', 'Unknown: no live data']
+    : safety.all_ok
+      ? ['badge badge-ok', 'All checks pass']
+      : ['badge badge-bad', 'Checks failing']
   return (
-    <div className="safety-panel">
-      <p className={safety.all_ok ? 'badge badge-ok' : 'badge badge-bad'}>
-        {safety.all_ok ? 'All checks pass' : 'Checks failing'}
+    <div className="safety-panel" data-stale={stale}>
+      <p className={cls} data-testid="safety-verdict">
+        {text}
       </p>
       <ul className="checks">
         {CHECKS.map(({ key, label }) => (

@@ -38,6 +38,7 @@ function rec(i: number, over: Partial<WindowRecord> = {}): WindowRecord {
     resolved_at: start + 326,
     resolution_seen_ms: (start + 326) * 1000,
     twap_source: 'polybolt',
+    final_twap_source: 'polybolt',
     coverage_secs: 300,
     status: 'complete',
     session_id: 's',
@@ -199,6 +200,7 @@ describe('windows list', () => {
       resolved_at: null,
       resolution_seen_ms: null,
       twap_source: null,
+      final_twap_source: null,
       coverage_secs: 0,
       status: 'upcoming',
     })
