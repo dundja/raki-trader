@@ -98,8 +98,11 @@ test('windows list opens a window detail', async ({ page }) => {
   await expect(rows.first()).toBeVisible({ timeout: 10_000 })
   await screenshot(page, 'windows')
 
-  const slug = (await rows.first().getAttribute('data-testid'))!.replace('window-row-', '')
-  await rows.first().getByRole('link').click()
+  // The newest rows are upcoming windows with no series yet; prefer a finished one to exercise the chart.
+  const complete = rows.filter({ hasText: 'complete' })
+  const row = (await complete.count()) > 0 ? complete.first() : rows.first()
+  const slug = (await row.getAttribute('data-testid'))!.replace('window-row-', '')
+  await row.getByRole('link').click()
   await expect(page).toHaveURL(new RegExp(`/windows/${slug}$`))
 
   const chart = page.getByTestId('price-chart')
