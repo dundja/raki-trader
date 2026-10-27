@@ -25,7 +25,7 @@ make dev            # Postgres, then traderd and the dashboard dev server side b
 ```sh
 make db-up          # Postgres 17 on 127.0.0.1:5433 (local dev credentials raki/raki)
 make backend-run    # traderd --config config/traderd.toml, kept awake with caffeinate
-make frontend-dev   # dashboard dev server (vite) on port 3000
+make frontend-dev   # dashboard dev server (vite) on port 3000; fails if the port is taken
 ```
 
 Run them from the repo root. `data_dir = "data"` in `config/traderd.toml` resolves against the

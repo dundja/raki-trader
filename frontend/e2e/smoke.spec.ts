@@ -10,6 +10,26 @@ import { expect, test, type Page } from '@playwright/test'
  * A manual pause, a Kill, a loss cap or a config halt is the operator's decision and is left alone.
  */
 
+/** The dashboard's page title: proves the server on the base URL is this app. */
+const DASHBOARD_MARKER = '<title>Raki Trader</title>'
+
+// Port 3000 may belong to another app on this machine, and Playwright reuses whatever answers
+// there. Refuse to run against anything that is not the dashboard.
+test.beforeAll(async ({ playwright }, testInfo) => {
+  const baseURL = testInfo.project.use.baseURL
+  const request = await playwright.request.newContext({ baseURL })
+  try {
+    const html = await (await request.get('/')).text()
+    if (!html.includes(DASHBOARD_MARKER)) {
+      throw new Error(
+        `${baseURL} is not the Raki dashboard (no ${DASHBOARD_MARKER}); another app holds the port`,
+      )
+    }
+  } finally {
+    await request.dispose()
+  }
+})
+
 /** Stop kinds the backend sets by itself; resuming from these does not override the operator. */
 const AUTOMATIC_STOPS = new Set(['safety', 'startup'])
 
