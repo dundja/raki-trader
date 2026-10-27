@@ -53,3 +53,28 @@ export function fmtUtc(ms: number): string {
   if (!Number.isFinite(ms)) return DASH
   return `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`
 }
+
+/** A number with an explicit sign ("+40.00", "-3.20"). Display only. null/invalid → "—". */
+export function fmtSigned(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return DASH
+  return v.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    signDisplay: 'always',
+  })
+}
+
+/** A plain count with thousands separators. null/invalid → "—". */
+export function fmtInt(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return DASH
+  return v.toLocaleString('en-US', { maximumFractionDigits: 0 })
+}
+
+/** Bytes as megabytes (1 MB = 1e6 bytes), one decimal. */
+export function fmtMb(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return DASH
+  return `${(bytes / 1e6).toLocaleString('en-US', {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })} MB`
+}
