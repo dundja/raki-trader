@@ -7,6 +7,8 @@ use raki_core::{FeedStatusDto, Source};
 
 /// `msgs_per_sec` is averaged over this trailing window.
 const RATE_WINDOW_SECS: i64 = 10;
+/// `events_dropped_recent` covers this trailing window.
+const DROP_WINDOW_SECS: i64 = 60;
 /// Staleness threshold for a source missing from the `stale_ms` map.
 const DEFAULT_STALE_MS: i64 = 10_000;
 
@@ -14,13 +16,21 @@ const DEFAULT_STALE_MS: i64 = 10_000;
 struct FeedState {
     enabled: bool,
     stale_ms: i64,
-    connected: bool,
+    /// Connections currently open. A sharded feed (CLOB) runs several.
+    open: u32,
+    /// Connections the feed runs when healthy; `connected` needs all of them open.
+    want: u32,
+    /// Last data message (control frames such as pongs and heartbeats do not count).
     last_msg_ms: Option<i64>,
     msgs_total: u64,
-    /// Messages per epoch second, oldest first, covering at most the rate window.
+    /// Data messages per epoch second, oldest first, covering at most the rate window.
     per_sec: VecDeque<(i64, u32)>,
     reconnects: u32,
     last_error: Option<String>,
+    /// Parsed events the engine never got because its channel was full.
+    dropped_total: u64,
+    /// Dropped events per epoch second, covering at most the drop window.
+    dropped_per_sec: VecDeque<(i64, u32)>,
 }
 
 impl FeedState {
@@ -28,23 +38,38 @@ impl FeedState {
         FeedState {
             enabled,
             stale_ms,
-            connected: false,
+            open: 0,
+            want: 1,
             last_msg_ms: None,
             msgs_total: 0,
             per_sec: VecDeque::new(),
             reconnects: 0,
             last_error: None,
+            dropped_total: 0,
+            dropped_per_sec: VecDeque::new(),
         }
     }
 
     fn prune(&mut self, now_sec: i64) {
-        while self
-            .per_sec
-            .front()
-            .is_some_and(|&(sec, _)| sec <= now_sec - RATE_WINDOW_SECS)
-        {
-            self.per_sec.pop_front();
-        }
+        prune(&mut self.per_sec, now_sec - RATE_WINDOW_SECS);
+        prune(&mut self.dropped_per_sec, now_sec - DROP_WINDOW_SECS);
+    }
+}
+
+/// Drops the buckets at or before `oldest_excluded`.
+fn prune(buckets: &mut VecDeque<(i64, u32)>, oldest_excluded: i64) {
+    while buckets
+        .front()
+        .is_some_and(|&(sec, _)| sec <= oldest_excluded)
+    {
+        buckets.pop_front();
+    }
+}
+
+fn bump(buckets: &mut VecDeque<(i64, u32)>, sec: i64) {
+    match buckets.back_mut() {
+        Some((last, n)) if *last == sec => *n += 1,
+        _ => buckets.push_back((sec, 1)),
     }
 }
 
@@ -101,41 +126,68 @@ impl FeedStatusRegistry {
         f(&mut self.inner.lock().expect("feed status mutex poisoned"))
     }
 
-    pub fn on_connected(&self, s: Source) {
-        self.with(|r| r.feed(s).connected = true);
+    /// How many connections `s` runs when healthy (default 1). The feed counts as connected only
+    /// while all of them are open.
+    pub fn expect_connections(&self, s: Source, n: u32) {
+        self.with(|r| r.feed(s).want = n.max(1));
     }
 
-    /// Counts a reconnect when an open connection drops. A failed connect attempt only updates
-    /// `last_error`.
+    pub fn on_connected(&self, s: Source) {
+        self.with(|r| r.feed(s).open += 1);
+    }
+
+    /// An open connection dropped: counts a reconnect.
     pub fn on_disconnected(&self, s: Source, err: Option<String>) {
         self.with(|r| {
             let f = r.feed(s);
-            if f.connected {
-                f.reconnects += 1;
-            }
-            f.connected = false;
+            f.open = f.open.saturating_sub(1);
+            f.reconnects += 1;
             if err.is_some() {
                 f.last_error = err;
             }
         });
     }
 
+    /// An open connection closed on shutdown: not a reconnect.
+    pub fn on_stopped(&self, s: Source) {
+        self.with(|r| {
+            let f = r.feed(s);
+            f.open = f.open.saturating_sub(1);
+        });
+    }
+
+    /// A connect attempt failed; no connection was open.
+    pub fn on_connect_failed(&self, s: Source, err: String) {
+        self.with(|r| r.feed(s).last_error = Some(err));
+    }
+
+    /// A data message arrived. Control frames (pongs, heartbeats, acks) must not be reported here,
+    /// or a feed whose subscriptions stopped delivering would still look fresh.
     pub fn on_message(&self, s: Source, now_ms: i64) {
         self.with(|r| {
             let f = r.feed(s);
             f.last_msg_ms = Some(now_ms);
             f.msgs_total += 1;
             let sec = now_ms.div_euclid(1_000);
-            match f.per_sec.back_mut() {
-                Some((last, n)) if *last == sec => *n += 1,
-                _ => f.per_sec.push_back((sec, 1)),
-            }
+            bump(&mut f.per_sec, sec);
             f.prune(sec);
         });
     }
 
-    /// `msgs_per_sec` covers the trailing 10 s. A feed is stale when it is enabled and either
-    /// disconnected or silent for longer than its `stale_ms`.
+    /// A parsed event was dropped because the engine's channel was full.
+    pub fn on_event_dropped(&self, s: Source, now_ms: i64) {
+        self.with(|r| {
+            let f = r.feed(s);
+            f.dropped_total += 1;
+            let sec = now_ms.div_euclid(1_000);
+            bump(&mut f.dropped_per_sec, sec);
+            f.prune(sec);
+        });
+    }
+
+    /// `msgs_per_sec` covers the trailing 10 s, `events_dropped_recent` the trailing 60 s. A feed
+    /// is stale when it is enabled and either not fully connected or without data for longer
+    /// than its `stale_ms`.
     pub fn snapshot(&self, now_ms: i64) -> Vec<FeedStatusDto> {
         self.with(|r| {
             let Registry { order, feeds, .. } = r;
@@ -145,17 +197,21 @@ impl FeedStatusRegistry {
                     let f = feeds.get_mut(s).expect("ordered source is registered");
                     f.prune(now_ms.div_euclid(1_000));
                     let recent: u32 = f.per_sec.iter().map(|&(_, n)| n).sum();
+                    let dropped_recent: u32 = f.dropped_per_sec.iter().map(|&(_, n)| n).sum();
                     let silent = f.last_msg_ms.is_none_or(|t| now_ms - t > f.stale_ms);
+                    let connected = f.open >= f.want;
                     FeedStatusDto {
                         source: *s,
                         enabled: f.enabled,
-                        connected: f.connected,
+                        connected,
                         last_msg_ms: f.last_msg_ms,
                         msgs_total: f.msgs_total,
                         msgs_per_sec: f64::from(recent) / RATE_WINDOW_SECS as f64,
                         reconnects: f.reconnects,
                         last_error: f.last_error.clone(),
-                        stale: f.enabled && (!f.connected || silent),
+                        stale: f.enabled && (!connected || silent),
+                        events_dropped: f.dropped_total,
+                        events_dropped_recent: dropped_recent,
                     }
                 })
                 .collect()
@@ -217,7 +273,7 @@ mod tests {
     #[test]
     fn reconnects_count_dropped_connections_only() {
         let r = registry();
-        r.on_disconnected(Source::Binance, Some("refused".into()));
+        r.on_connect_failed(Source::Binance, "refused".into());
         assert_eq!(get(&r, Source::Binance, T0).reconnects, 0);
         r.on_connected(Source::Binance);
         r.on_disconnected(Source::Binance, None);
@@ -225,5 +281,43 @@ mod tests {
         assert_eq!(f.reconnects, 1);
         assert_eq!(f.last_error.as_deref(), Some("refused"));
         assert!(!f.connected && f.stale);
+        // A shutdown close is not a reconnect.
+        r.on_connected(Source::Binance);
+        r.on_stopped(Source::Binance);
+        let f = get(&r, Source::Binance, T0);
+        assert_eq!(f.reconnects, 1);
+        assert!(!f.connected);
+    }
+
+    #[test]
+    fn sharded_feed_is_connected_only_with_every_shard_open() {
+        let r = registry();
+        r.expect_connections(Source::Binance, 3);
+        r.on_message(Source::Binance, T0);
+        r.on_connected(Source::Binance);
+        r.on_connected(Source::Binance);
+        let f = get(&r, Source::Binance, T0);
+        assert!(!f.connected && f.stale, "2 of 3 shards open");
+        r.on_connected(Source::Binance);
+        assert!(get(&r, Source::Binance, T0).connected);
+        // One shard failing to reconnect keeps the feed down even when another shard flaps.
+        r.on_disconnected(Source::Binance, Some("1013".into()));
+        r.on_connect_failed(Source::Binance, "refused".into());
+        r.on_disconnected(Source::Binance, None);
+        r.on_connected(Source::Binance);
+        let f = get(&r, Source::Binance, T0);
+        assert!(!f.connected && f.stale);
+        assert_eq!(f.reconnects, 2);
+    }
+
+    #[test]
+    fn dropped_events_counted_over_the_last_minute() {
+        let r = registry();
+        r.on_event_dropped(Source::Binance, T0);
+        r.on_event_dropped(Source::Binance, T0 + 500);
+        let f = get(&r, Source::Binance, T0 + 1_000);
+        assert_eq!((f.events_dropped, f.events_dropped_recent), (2, 2));
+        let f = get(&r, Source::Binance, T0 + 60_000);
+        assert_eq!((f.events_dropped, f.events_dropped_recent), (2, 0));
     }
 }

@@ -48,7 +48,11 @@ pub struct WindowRecord {
     pub resolved_at: Option<i64>,
     #[ts(type = "number | null")]
     pub resolution_seen_ms: Option<i64>,
+    /// Source of our price-to-beat point (the TWAP at the window start).
     pub twap_source: Option<Source>,
+    /// Source of our final TWAP point (the TWAP at the window end). The M1 gate counts BTC
+    /// windows whose final point came from PolyBolt.
+    pub final_twap_source: Option<Source>,
     pub coverage_secs: i32,
     pub status: WindowStatus,
     pub session_id: String,
@@ -94,7 +98,14 @@ pub struct FeedStatusDto {
     pub msgs_per_sec: f64,
     pub reconnects: u32,
     pub last_error: Option<String>,
+    /// Enabled and either not fully connected or without data for longer than its threshold.
+    /// Only data frames count: pongs, heartbeats and acks do not keep a feed fresh.
     pub stale: bool,
+    /// Parsed events dropped because the engine fell behind (the raw frames are still recorded).
+    #[ts(type = "number")]
+    pub events_dropped: u64,
+    /// Of those, how many in the last 60 s.
+    pub events_dropped_recent: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -130,13 +141,35 @@ pub struct RecorderStatus {
     pub last_flush_ms: Option<i64>,
 }
 
+/// The Postgres writer: failed writes are kept and retried, never silently dropped.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct StoreStatus {
+    /// False while writes are failing (they are retried).
+    pub ok: bool,
+    /// Writes waiting to be stored.
+    #[ts(type = "number")]
+    pub pending_writes: u64,
+    /// Writes lost because the retry buffers overflowed during a long outage.
+    #[ts(type = "number")]
+    pub dropped_writes: u64,
+    #[ts(type = "number | null")]
+    pub last_ok_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SafetyChecks {
+    /// Every enabled feed connected, delivering data, and none of its events dropped recently.
     pub feeds_fresh: bool,
+    /// Offset within the limit, measured recently.
     pub clock_ok: bool,
+    /// Not blocked, checked recently.
     pub geoblock_ok: bool,
     pub recorder_ok: bool,
+    /// Database writes succeeding.
+    pub store_ok: bool,
     pub all_ok: bool,
     pub reasons: Vec<String>,
 }
@@ -148,6 +181,7 @@ pub struct HealthSnapshot {
     pub clock: ClockStatus,
     pub geoblock: GeoStatus,
     pub recorder: RecorderStatus,
+    pub store: StoreStatus,
     pub sleep_events: u32,
     pub book_resyncs: u32,
     pub safety: SafetyChecks,
@@ -236,24 +270,48 @@ pub struct LiveSnapshot {
     pub windows: Vec<LiveWindow>,
 }
 
+/// Progress toward the M1 gate (CLAUDE.md §5): at least 500 **BTC** windows recorded with
+/// **PolyBolt**, whose final TWAP matches Gamma's `finalPrice`. The `gate_*` fields count exactly
+/// those windows; the other window counts cover every asset and TWAP source and are informational.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RecordingStats {
     #[ts(type = "number")]
     pub sessions: i64,
+    /// Time the app was running and awake (machine sleep excluded).
     #[ts(type = "number")]
     pub recorded_secs: i64,
+    /// Machine sleep inside sessions, not counted in `recorded_secs`.
+    #[ts(type = "number")]
+    pub slept_secs: i64,
+    /// Windows that started (upcoming windows excluded), all assets.
     #[ts(type = "number")]
     pub windows_total: i64,
+    /// Windows with our final TWAP, all assets and sources.
     #[ts(type = "number")]
     pub windows_with_twap: i64,
     #[ts(type = "number")]
     pub twap_match: i64,
     #[ts(type = "number")]
     pub twap_mismatch: i64,
+    /// Final TWAP known, Gamma's final price still expected.
     #[ts(type = "number")]
-    pub twap_pending: i64,
-    /// Number of windows needed to pass the M1 gate (500).
+    pub twap_awaiting: i64,
+    /// Final TWAP known, but the window timed out without Gamma's final price: never verified.
+    #[ts(type = "number")]
+    pub twap_unverified: i64,
+    /// BTC windows whose final TWAP came from PolyBolt: the gate count.
+    #[ts(type = "number")]
+    pub gate_windows: i64,
+    #[ts(type = "number")]
+    pub gate_twap_match: i64,
+    #[ts(type = "number")]
+    pub gate_twap_mismatch: i64,
+    #[ts(type = "number")]
+    pub gate_twap_awaiting: i64,
+    #[ts(type = "number")]
+    pub gate_twap_unverified: i64,
+    /// Number of gate windows needed to pass the M1 gate (500).
     #[ts(type = "number")]
     pub gate_target_windows: i64,
 }

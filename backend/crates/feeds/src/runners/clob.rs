@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use raki_core::Source;
+use raki_core::{Asset, Source};
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -20,7 +20,11 @@ pub struct ClobTiming {
     pub ping: Duration,
     /// Reconnect when no `PONG` arrives for this long.
     pub pong_timeout: Duration,
-    /// Reconnect delay after a clean server close (1000), which follows `market_resolved`.
+    /// Reconnect when no data frame (book, price change, trade, ...) arrives for this long while
+    /// subscribed. `PONG`s keep the socket alive but are not data.
+    pub data_timeout: Duration,
+    /// Reconnect delay after a server close that a quick reconnect fixes: 1000 (follows
+    /// `market_resolved`) and 1013 ("slow consumer: send buffer full").
     pub clean_close_delay: Duration,
 }
 
@@ -29,6 +33,7 @@ impl Default for ClobTiming {
         ClobTiming {
             ping: Duration::from_secs(5),
             pong_timeout: Duration::from_secs(15),
+            data_timeout: Duration::from_secs(30),
             clean_close_delay: Duration::from_millis(250),
         }
     }
@@ -37,19 +42,31 @@ impl Default for ClobTiming {
 /// Subscribes to every token in `desired` and follows its changes. With an empty set it stays
 /// connected without subscribing and without pinging: the live server closes with 1008 on a
 /// `PING` sent before any subscribe.
-pub async fn run_clob(ctx: FeedCtx, url: String, desired: watch::Receiver<BTreeSet<String>>) {
-    run_clob_with(ctx, url, desired, default_backoff(), ClobTiming::default()).await;
+///
+/// `shard` is the asset this connection covers when the CLOB is split into one connection per
+/// asset: one socket for every token overflows the server's per-connection send buffer (close
+/// 1013) at peak rates.
+pub async fn run_clob(
+    ctx: FeedCtx,
+    url: String,
+    shard: Option<Asset>,
+    desired: watch::Receiver<BTreeSet<String>>,
+) {
+    let timing = ClobTiming::default();
+    run_clob_with(ctx, url, shard, desired, default_backoff(), timing).await;
 }
 
 pub async fn run_clob_with(
     ctx: FeedCtx,
     url: String,
+    shard: Option<Asset>,
     desired: watch::Receiver<BTreeSet<String>>,
     backoff: Backoff,
     timing: ClobTiming,
 ) {
     let clob = Clob {
         url,
+        shard,
         desired,
         desired_open: true,
         timing,
@@ -59,6 +76,7 @@ pub async fn run_clob_with(
 
 struct Clob {
     url: String,
+    shard: Option<Asset>,
     desired: watch::Receiver<BTreeSet<String>>,
     /// False once the sender is gone: the set can no longer change.
     desired_open: bool,
@@ -132,9 +150,13 @@ impl Session for Clob {
         &self.url
     }
 
-    /// The `PONG` deadline covers liveness.
+    /// Unsubscribed, nothing is expected; the data deadline starts with the first subscribe.
     fn idle_timeout(&self) -> Option<Duration> {
         None
+    }
+
+    fn shard(&self) -> Option<Asset> {
+        self.shard
     }
 
     /// The heartbeat starts with the first subscribe: the live server closes with 1008
@@ -144,6 +166,9 @@ impl Session for Clob {
         let want = self.desired.borrow_and_update().clone();
         if let Err(end) = subscribed.sync(link, want).await {
             return end;
+        }
+        if subscribed.initial_sent {
+            link.set_idle_timeout(Some(self.timing.data_timeout));
         }
         let mut ping = heartbeat(self.timing.ping);
         let mut pong_deadline = Instant::now() + self.timing.pong_timeout;
@@ -176,6 +201,7 @@ impl Session for Clob {
                         if !beating && subscribed.initial_sent {
                             ping = heartbeat(self.timing.ping);
                             pong_deadline = Instant::now() + self.timing.pong_timeout;
+                            link.set_idle_timeout(Some(self.timing.data_timeout));
                         }
                     }
                     Err(_) => self.desired_open = false,
@@ -186,11 +212,14 @@ impl Session for Clob {
 }
 
 impl Clob {
-    /// The server closes with 1000 right after `market_resolved`: reconnect quickly without
-    /// growing the backoff. A connection closed before any frame arrived takes the normal
-    /// backoff, so a server that rejects us at once is not hammered every 250 ms.
+    /// The server closes with 1000 right after `market_resolved`, and with 1013 ("slow consumer:
+    /// send buffer full") when a burst overflows its per-connection buffer. Both are fixed by
+    /// reconnecting at once: do so without growing the backoff, so the gap stays near 250 ms
+    /// even when closes come less than a minute apart. A connection closed before any frame
+    /// arrived takes the normal backoff, so a server that rejects us at once is not hammered
+    /// every 250 ms.
     fn on_end(&self, end: End, texts: u64) -> End {
-        if end.close_code() == Some(1000) && texts > 0 {
+        if matches!(end.close_code(), Some(1000 | 1013)) && texts > 0 {
             end.retry(Retry::After(self.timing.clean_close_delay))
         } else {
             end

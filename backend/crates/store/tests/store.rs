@@ -87,6 +87,7 @@ fn window(slug: &str, asset: Asset, start_ts: i64, session: Uuid) -> WindowRecor
         resolved_at: None,
         resolution_seen_ms: None,
         twap_source: None,
+        final_twap_source: None,
         coverage_secs: 10,
         status: WindowStatus::Live,
         session_id: session.to_string(),
@@ -289,32 +290,240 @@ async fn recording_stats_counts() {
         .await
         .unwrap();
 
-    let mut matched = window("m", Asset::Btc, 100, s1);
-    matched.final_twap_ours = Some(1.0);
-    matched.twap_match = Some(true);
-    let mut mismatched = window("x", Asset::Eth, 200, s1);
-    mismatched.final_twap_ours = Some(2.0);
-    mismatched.twap_match = Some(false);
-    let mut pending = window("p", Asset::Sol, 300, s1);
-    pending.final_twap_ours = Some(3.0);
-    for w in [&matched, &mismatched, &pending] {
-        store.upsert_window(w).await.unwrap();
+    let with_final = |slug: &str, asset, start, final_source, matched: Option<bool>| {
+        let mut w = window(slug, asset, start, s1);
+        w.final_twap_ours = Some(1.0);
+        w.final_twap_source = final_source;
+        w.twap_match = matched;
+        w
+    };
+    for w in [
+        // Gate windows: BTC with a PolyBolt final point.
+        with_final(
+            "g-match",
+            Asset::Btc,
+            100,
+            Some(Source::Polybolt),
+            Some(true),
+        ),
+        with_final(
+            "g-miss",
+            Asset::Btc,
+            110,
+            Some(Source::Polybolt),
+            Some(false),
+        ),
+        with_final("g-wait", Asset::Btc, 120, Some(Source::Polybolt), None),
+        {
+            let mut w = with_final("g-out", Asset::Btc, 130, Some(Source::Polybolt), None);
+            w.status = WindowStatus::TimedOut;
+            w
+        },
+        // Not gate windows: an RTDS final, another asset, an unknown final source.
+        with_final(
+            "rtds",
+            Asset::Btc,
+            140,
+            Some(Source::RtdsLegacy),
+            Some(true),
+        ),
+        with_final("eth", Asset::Eth, 150, Some(Source::Polybolt), Some(true)),
+        with_final("old", Asset::Btc, 160, None, None),
+        // No TWAP at all; and an upcoming window, which is not counted at all.
+        window("n", Asset::Btc, 400, s1),
+        {
+            let mut w = window("u", Asset::Btc, 700, s1);
+            w.status = WindowStatus::Upcoming;
+            w
+        },
+    ] {
+        store.upsert_window(&w).await.unwrap();
     }
-    // A window with no TWAP at all counts only toward the total.
-    store
-        .upsert_window(&window("n", Asset::Btc, 400, s1))
-        .await
-        .unwrap();
 
     let st = store.recording_stats().await.unwrap();
     assert_eq!(st.sessions, 2);
     assert!(st.recorded_secs >= 60, "got {}", st.recorded_secs);
-    assert_eq!(st.windows_total, 4);
-    assert_eq!(st.windows_with_twap, 3);
-    assert_eq!(st.twap_match, 1);
-    assert_eq!(st.twap_mismatch, 1);
-    assert_eq!(st.twap_pending, 1);
+    assert_eq!(st.windows_total, 8, "upcoming excluded");
+    assert_eq!(st.windows_with_twap, 7);
+    assert_eq!((st.twap_match, st.twap_mismatch), (3, 1));
+    assert_eq!((st.twap_awaiting, st.twap_unverified), (2, 1));
+    assert_eq!(st.gate_windows, 4, "BTC + PolyBolt final only");
+    assert_eq!((st.gate_twap_match, st.gate_twap_mismatch), (1, 1));
+    assert_eq!((st.gate_twap_awaiting, st.gate_twap_unverified), (1, 1));
     assert_eq!(st.gate_target_windows, 500);
+}
+
+#[tokio::test]
+async fn upsert_never_regresses_known_fields_or_status() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1, "v", "h").await.unwrap();
+
+    let mut full = window("btc-updown-5m-1000", Asset::Btc, 1000, s);
+    full.price_to_beat_ours = Some(100.0);
+    full.twap_source = Some(Source::Polybolt);
+    full.final_twap_ours = Some(101.0);
+    full.final_twap_source = Some(Source::Polybolt);
+    full.outcome_ours = Some(Outcome::Up);
+    full.price_to_beat_gamma = Some(100.0);
+    full.winner = Some(Outcome::Up);
+    full.resolved_at = Some(1_330);
+    full.resolution_seen_ms = Some(1_326_000);
+    full.status = WindowStatus::Resolved;
+    full.updated_ms = 5_000;
+    store.upsert_window(&full).await.unwrap();
+
+    // A restarted engine's first record for the same window knows nothing yet.
+    let mut sparse = window("btc-updown-5m-1000", Asset::Btc, 1000, Uuid::now_v7());
+    sparse.event_id = None;
+    sparse.condition_id = None;
+    sparse.up_token = None;
+    sparse.down_token = None;
+    sparse.price_to_beat_ours = None;
+    sparse.coverage_secs = 0;
+    sparse.status = WindowStatus::Live;
+    sparse.updated_ms = 6_000;
+    store.upsert_window(&sparse).await.unwrap();
+
+    let got = store.get_window(&full.slug).await.unwrap().unwrap();
+    assert_eq!(
+        got,
+        WindowRecord {
+            updated_ms: 6_000,
+            ..full.clone()
+        },
+        "nothing regressed"
+    );
+
+    // A later, conflicting winner does not replace the latched one; new facts still land.
+    let mut later = full.clone();
+    later.winner = Some(Outcome::Down);
+    later.resolved_at = Some(9_999);
+    later.final_price_gamma = Some(101.0);
+    later.twap_match = Some(true);
+    later.status = WindowStatus::Complete;
+    later.updated_ms = 7_000;
+    store.upsert_window(&later).await.unwrap();
+    let got = store.get_window(&full.slug).await.unwrap().unwrap();
+    assert_eq!(got.winner, Some(Outcome::Up));
+    assert_eq!(got.resolved_at, Some(1_330));
+    assert_eq!(got.final_price_gamma, Some(101.0));
+    assert_eq!(got.twap_match, Some(true));
+    assert_eq!(got.status, WindowStatus::Complete);
+
+    // Timed out ranks below complete, so a late final price still completes a window, and a
+    // stale `resolved` cannot undo a timeout.
+    let mut t = window("btc-updown-5m-2000", Asset::Btc, 2000, s);
+    t.status = WindowStatus::TimedOut;
+    store.upsert_window(&t).await.unwrap();
+    t.status = WindowStatus::Resolved;
+    store.upsert_window(&t).await.unwrap();
+    assert_eq!(
+        store.get_window(&t.slug).await.unwrap().unwrap().status,
+        WindowStatus::TimedOut
+    );
+    t.status = WindowStatus::Complete;
+    store.upsert_window(&t).await.unwrap();
+    assert_eq!(
+        store.get_window(&t.slug).await.unwrap().unwrap().status,
+        WindowStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn dangling_sessions_close_as_crash_at_last_evidence() {
+    let store = fresh_store().await;
+    let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    // a: crashed; its heartbeat is the latest evidence.
+    store.start_session(a, 1_000, "v", "h").await.unwrap();
+    store.heartbeat(a, 50_000).await.unwrap();
+    store
+        .insert_gap(a, Source::Binance, 40_000, "reconnect")
+        .await
+        .unwrap();
+    // b: crashed without a heartbeat; its window update is the evidence.
+    store.start_session(b, 100_000, "v", "h").await.unwrap();
+    let mut w = window("w", Asset::Btc, 100, b);
+    w.updated_ms = 130_000;
+    store.upsert_window(&w).await.unwrap();
+    // c: ended cleanly.
+    store.start_session(c, 200_000, "v", "h").await.unwrap();
+    store.end_session(c, 260_000, "shutdown").await.unwrap();
+
+    let mut closed = store.close_dangling_sessions(300_000).await.unwrap();
+    closed.sort();
+    let mut want = vec![(a, 50_000), (b, 130_000)];
+    want.sort();
+    assert_eq!(closed, want);
+    assert!(
+        store
+            .close_dangling_sessions(300_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let reasons: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("select id, end_reason from sessions order by started_ms")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(reasons[0].1.as_deref(), Some("crash"));
+    assert_eq!(reasons[2].1.as_deref(), Some("shutdown"));
+    let crash_gaps: i64 = sqlx::query(
+        "select count(*) from feed_gaps where source = 'system' and reason like 'crash%'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap()
+    .get(0);
+    assert_eq!(crash_gaps, 2);
+    // Recorded time no longer runs on forever: 49 s + 30 s + 60 s.
+    assert_eq!(store.recording_stats().await.unwrap().recorded_secs, 139);
+}
+
+#[tokio::test]
+async fn sleep_is_a_gap_and_not_recorded_time() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 0, "v", "h").await.unwrap();
+    store.record_sleep(s, 3_000_000, 1_800_000).await.unwrap();
+    store.end_session(s, 3_600_000, "shutdown").await.unwrap();
+
+    let gap = sqlx::query("select source, at_ms, reason, duration_ms from feed_gaps")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(gap.get::<String, _>("source"), "system");
+    assert_eq!(gap.get::<String, _>("reason"), "sleep");
+    assert_eq!(gap.get::<i64, _>("at_ms"), 1_200_000);
+    assert_eq!(gap.get::<Option<i64>, _>("duration_ms"), Some(1_800_000));
+    let st = store.recording_stats().await.unwrap();
+    assert_eq!((st.recorded_secs, st.slept_secs), (1_800, 1_800));
+}
+
+#[tokio::test]
+async fn unfinished_windows_for_adoption() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1, "v", "h").await.unwrap();
+    for (slug, start, status) in [
+        ("old", 100, WindowStatus::Ended),
+        ("done", 1_000, WindowStatus::Complete),
+        ("out", 1_300, WindowStatus::TimedOut),
+        ("res", 1_600, WindowStatus::Resolved),
+        ("live", 1_900, WindowStatus::Live),
+    ] {
+        let mut w = window(slug, Asset::Btc, start, s);
+        w.status = status;
+        store.upsert_window(&w).await.unwrap();
+    }
+    let got = store.unfinished_windows(1_000, 10).await.unwrap();
+    assert_eq!(
+        got.iter().map(|w| w.slug.as_str()).collect::<Vec<_>>(),
+        ["live", "res", "out"]
+    );
+    assert_eq!(store.unfinished_windows(1_000, 1).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

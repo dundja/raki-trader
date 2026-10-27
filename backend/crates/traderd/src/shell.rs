@@ -1,30 +1,39 @@
 //! The engine loop: the single task that owns the [`Engine`] and carries out what it asks for.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use raki_api::{ControlCommand, ControlMsg};
 use raki_core::{
-    ControlResponse, FeedEvent, HealthSnapshot, LiveSnapshot, RecorderStatus, SessionInfo, Source,
-    now_ms,
+    Asset, ControlResponse, FeedEvent, HealthSnapshot, LiveSnapshot, RecorderStatus, SessionInfo,
+    Source, now_ms,
 };
-use raki_engine::engine::{Engine, EngineOutput, Request};
+use raki_engine::engine::{DesiredTokens, Engine, EngineOutput, Request};
 use raki_feeds::rest::PolyRest;
 use raki_feeds::status::FeedStatusRegistry;
 use raki_recorder::RecorderStats;
-use raki_store::Store;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::health::{self, HealthState};
+use crate::health::sleep::SleepNotice;
+use crate::health::{self, HealthState, SafetyInputs};
+use crate::writer::{Audit, Write, WriterStats, WriterTx};
 
 const TICK: Duration = Duration::from_secs(1);
 /// The recorder safety check looks at drops over this trailing window.
 const DROP_WINDOW_MS: i64 = 60_000;
+/// The session's heartbeat in Postgres, which dates a crash at the next start.
+const HEARTBEAT_EVERY_MS: i64 = 10_000;
+/// A control reply waits this long for its audit row; past it the reply goes out and the audit
+/// stays queued in the writer.
+const AUDIT_WAIT: Duration = Duration::from_secs(1);
+/// At shutdown, the writer gets this long to store what is pending.
+const WRITER_FINISH_WITHIN: Duration = Duration::from_millis(1_500);
 
 /// This app run.
 #[derive(Clone, Debug)]
@@ -49,8 +58,17 @@ pub struct LoopIo {
     pub events_tx: mpsc::Sender<FeedEvent>,
     pub events_rx: mpsc::Receiver<FeedEvent>,
     pub control_rx: mpsc::Receiver<ControlMsg>,
-    pub desired_tx: watch::Sender<BTreeSet<String>>,
+    /// One CLOB runner per asset, each following its own token set.
+    pub desired_tx: BTreeMap<Asset, watch::Sender<BTreeSet<String>>>,
     pub live_tx: watch::Sender<LiveSnapshot>,
+    /// Machine sleeps detected by the sleep monitor.
+    pub sleep_rx: mpsc::Receiver<SleepNotice>,
+}
+
+/// Where the engine loop's database writes go.
+pub struct StoreIo {
+    pub writer: WriterTx,
+    pub task: JoinHandle<()>,
 }
 
 /// What the health snapshot and the safety checks are built from.
@@ -58,6 +76,7 @@ pub struct HealthInputs {
     pub feeds: Arc<FeedStatusRegistry>,
     pub state: Arc<HealthState>,
     pub recorder: Arc<RecorderStats>,
+    pub store: Arc<WriterStats>,
 }
 
 impl HealthInputs {
@@ -82,12 +101,22 @@ impl HealthInputs {
         let clock = self.state.clock();
         let geoblock = self.state.geo();
         let recorder = self.recorder_status();
-        let safety = health::safety(&feeds, &clock, &geoblock, &recorder, dropped_last_min);
+        let store = self.store.status();
+        let safety = health::safety(&SafetyInputs {
+            feeds: &feeds,
+            clock: &clock,
+            geo: &geoblock,
+            rec: &recorder,
+            rec_dropped_last_min: dropped_last_min,
+            store: &store,
+            max_ages: self.state.max_ages(),
+        });
         HealthSnapshot {
             feeds,
             clock,
             geoblock,
             recorder,
+            store,
             sleep_events: self.state.sleep_events(),
             book_resyncs,
             safety,
@@ -141,20 +170,23 @@ impl DropWindow {
     }
 }
 
-/// Runs until `shutdown`: one `select!` over feed events, control messages and a 1 s tick.
+/// Runs until `shutdown`: one `select!` over feed events, control messages, sleep notices and a
+/// 1 s tick.
 ///
-/// - Engine outputs are carried out here: series rows are batched and flushed each tick, windows
-///   are upserted, REST requests run as spawned tasks whose results come back as events, the
-///   desired CLOB tokens go to the CLOB runner, and a book resync is logged and stored as a gap.
+/// - Engine outputs are carried out here: windows, series rows (batched per tick), gaps and audits
+///   go to the store writer, which never blocks this loop and retries failed writes; REST
+///   requests run as spawned tasks whose results come back as events; each asset's desired CLOB
+///   tokens go to that asset's CLOB runner; a book resync is logged and stored as a gap.
 /// - Every tick computes the safety checks, feeds them to the control state machine and publishes
-///   a [`LiveSnapshot`].
+///   a [`LiveSnapshot`]; every 10 s it writes the session heartbeat.
 /// - Control messages are applied, audited and answered.
-/// - A `FeedReset` after a source's first one is a reconnect: it is stored as a feed gap.
-///
-/// Store errors are logged and never stop the loop.
+/// - A `FeedReset` after a connection's first one (per source and shard) is a reconnect: it is
+///   stored as a feed gap. A machine sleep is stored as a gap with its duration.
+/// - On shutdown every tracked window is written once more (with its latest coverage), and the
+///   writer gets a short time to store what is pending.
 pub async fn run_engine_loop(
     engine: Engine,
-    store: Store,
+    store: StoreIo,
     rest: PolyRest,
     session: Session,
     io: LoopIo,
@@ -167,11 +199,12 @@ pub async fn run_engine_loop(
         mut control_rx,
         desired_tx,
         live_tx,
+        mut sleep_rx,
     } = io;
     let dropped = health.recorder.dropped.load(Ordering::Relaxed);
     let mut shell = Shell {
         engine,
-        store,
+        writer: store.writer,
         rest: Arc::new(rest),
         session,
         events_tx,
@@ -182,6 +215,7 @@ pub async fn run_engine_loop(
         series: Vec::new(),
         resets_seen: HashSet::new(),
         drops: DropWindow::new(now_ms(), dropped),
+        last_heartbeat_ms: None,
     };
     let mut tick = tokio::time::interval(TICK);
     // After a sleep, one tick rather than a burst: a burst would inflate coverage counts.
@@ -191,51 +225,71 @@ pub async fn run_engine_loop(
             biased;
             () = shutdown.cancelled() => break,
             Some(msg) = control_rx.recv() => shell.on_control(msg).await,
-            _ = tick.tick() => shell.on_tick().await,
-            Some(ev) = events_rx.recv() => shell.on_event(ev).await,
+            _ = tick.tick() => shell.on_tick(),
+            Some(notice) = sleep_rx.recv() => shell.on_sleep(notice),
+            Some(ev) = events_rx.recv() => shell.on_event(ev),
         }
     }
-    shell.flush_series().await;
+    shell.finish(store.task).await;
     tracing::info!("engine loop stopped");
 }
 
 struct Shell {
     engine: Engine,
-    store: Store,
+    writer: WriterTx,
     rest: Arc<PolyRest>,
     session: Session,
     events_tx: mpsc::Sender<FeedEvent>,
-    desired_tx: watch::Sender<BTreeSet<String>>,
+    desired_tx: BTreeMap<Asset, watch::Sender<BTreeSet<String>>>,
     live_tx: watch::Sender<LiveSnapshot>,
     health: HealthInputs,
     shutdown: CancellationToken,
     /// Series rows waiting for the next flush.
     series: Vec<raki_core::SeriesRow>,
-    /// Sources whose first `FeedReset` (the initial connect) has been seen.
-    resets_seen: HashSet<Source>,
+    /// Connections (source and shard) whose first `FeedReset` (the initial connect) was seen.
+    resets_seen: HashSet<(Source, Option<Asset>)>,
     drops: DropWindow,
+    last_heartbeat_ms: Option<i64>,
 }
 
 impl Shell {
-    async fn on_event(&mut self, ev: FeedEvent) {
+    fn on_event(&mut self, ev: FeedEvent) {
         let now = now_ms();
-        if let FeedEvent::FeedReset { source } = ev
-            && !self.resets_seen.insert(source)
+        if let FeedEvent::FeedReset { source, shard } = ev
+            && !self.resets_seen.insert((source, shard))
         {
-            self.gap(source, now, "reconnect").await;
+            let reason = match shard {
+                Some(asset) => format!("reconnect {}", asset.as_str()),
+                None => "reconnect".to_owned(),
+            };
+            self.gap(source, now, reason);
         }
         let outs = self.engine.handle(ev, now);
-        self.execute(outs, now).await;
+        self.execute(outs, now);
     }
 
-    async fn on_tick(&mut self) {
+    fn on_tick(&mut self) {
         let now = now_ms();
         let outs = self.engine.tick(now);
-        self.execute(outs, now).await;
-        self.flush_series().await;
+        self.execute(outs, now);
+        self.flush_series();
+        if self
+            .last_heartbeat_ms
+            .is_none_or(|t| now - t >= HEARTBEAT_EVERY_MS)
+        {
+            self.writer.send(Write::Heartbeat { at_ms: now });
+            self.last_heartbeat_ms = Some(now);
+        }
         let health = self.health_snapshot(now);
         self.engine.control().on_safety(&health.safety, now);
         self.publish(health, now);
+    }
+
+    fn on_sleep(&mut self, n: SleepNotice) {
+        self.writer.send(Write::Sleep {
+            wake_ms: n.wake_ms,
+            slept_ms: n.slept_ms,
+        });
     }
 
     fn health_snapshot(&mut self, now: i64) -> HealthSnapshot {
@@ -295,73 +349,102 @@ impl Shell {
             None => tracing::info!(action, to = ?resp.state.mode, ?reason, "control"),
             Some(error) => tracing::warn!(action, %error, "control refused"),
         }
-        // Audited before the answer: the client never sees an unaudited action.
-        if let Err(e) = self
-            .store
-            .insert_audit(
-                now,
+        // Audited before the answer: the reply waits (briefly) for the audit row. If the store is
+        // down the audit stays queued and is retried; the action itself stands either way.
+        let (done, stored) = oneshot::channel();
+        self.writer.send(Write::Audit {
+            audit: Audit {
+                at_ms: now,
                 action,
-                resp.ok,
+                ok: resp.ok,
                 from,
-                resp.state.mode,
-                reason.as_deref(),
-                resp.error.as_deref(),
-            )
-            .await
-        {
-            tracing::error!(error = ?e, "store: control audit");
+                to: resp.state.mode,
+                reason,
+                error: resp.error.clone(),
+            },
+            done: Some(done),
+        });
+        if !matches!(tokio::time::timeout(AUDIT_WAIT, stored).await, Ok(Ok(()))) {
+            tracing::warn!(action, "control audit not stored yet; it stays queued");
         }
-        // The API gave up waiting if the receiver is gone; the action still stands.
-        let _ = msg.reply.send(resp);
+        // Publish before replying, so a client that saw the reply also sees the new state.
         let health = self.health_snapshot(now);
         self.publish(health, now);
+        // The API gave up waiting if the receiver is gone; the action still stands.
+        let _ = msg.reply.send(resp);
     }
 
-    async fn execute(&mut self, outs: Vec<EngineOutput>, now: i64) {
+    fn execute(&mut self, outs: Vec<EngineOutput>, now: i64) {
         for out in outs {
             match out {
                 EngineOutput::Series(rows) => self.series.extend(rows),
-                EngineOutput::Window(rec) => {
-                    if let Err(e) = self.store.upsert_window(&rec).await {
-                        tracing::error!(error = ?e, slug = %rec.slug, "store: upsert window");
-                    }
-                }
+                EngineOutput::Window(rec) => self.writer.send(Write::Window(rec)),
                 EngineOutput::Requests(reqs) => {
                     for req in reqs {
                         self.spawn_request(req);
                     }
                 }
-                EngineOutput::DesiredTokens(tokens) => {
-                    tracing::info!(tokens = tokens.len(), "desired clob tokens changed");
-                    // `send_replace` stores the set even when the CLOB runner is disabled.
-                    self.desired_tx.send_replace(tokens);
-                }
+                EngineOutput::DesiredTokens(tokens) => self.send_desired(tokens),
                 EngineOutput::BookResync { asset_id } => {
                     tracing::warn!(%asset_id, "book snapshot disagreed with our book; resynced");
                     let reason = format!("book resync {asset_id}");
-                    self.gap(Source::ClobMarket, now, &reason).await;
+                    self.gap(Source::ClobMarket, now, reason);
                 }
             }
         }
     }
 
-    async fn flush_series(&mut self) {
-        if self.series.is_empty() {
-            return;
-        }
-        let rows = std::mem::take(&mut self.series);
-        if let Err(e) = self.store.insert_series(&rows).await {
-            tracing::error!(error = ?e, rows = rows.len(), "store: insert series");
+    fn send_desired(&self, tokens: DesiredTokens) {
+        let total: usize = tokens.values().map(BTreeSet::len).sum();
+        tracing::info!(tokens = total, "desired clob tokens changed");
+        for (asset, set) in tokens {
+            match self.desired_tx.get(&asset) {
+                // `send_if_modified` wakes a shard only when its own set changed.
+                Some(tx) => {
+                    tx.send_if_modified(|cur| {
+                        if *cur == set {
+                            return false;
+                        }
+                        *cur = set;
+                        true
+                    });
+                }
+                None => tracing::debug!(asset = asset.as_str(), "no clob runner for asset"),
+            }
         }
     }
 
-    async fn gap(&self, source: Source, at_ms: i64, reason: &str) {
-        if let Err(e) = self
-            .store
-            .insert_gap(self.session.id, source, at_ms, reason)
+    fn flush_series(&mut self) {
+        if !self.series.is_empty() {
+            self.writer
+                .send(Write::Series(std::mem::take(&mut self.series)));
+        }
+    }
+
+    fn gap(&self, source: Source, at_ms: i64, reason: String) {
+        self.writer.send(Write::Gap {
+            source,
+            at_ms,
+            reason,
+        });
+    }
+
+    /// Writes every tracked window once more (its coverage since the last upsert would otherwise
+    /// be lost), then gives the writer a short time to store everything pending.
+    async fn finish(mut self, writer_task: JoinHandle<()>) {
+        self.flush_series();
+        for rec in self.engine.records() {
+            self.writer.send(Write::Window(rec));
+        }
+        // The last sender: the writer stores what is pending and returns.
+        drop(self.writer);
+        let abort = writer_task.abort_handle();
+        if tokio::time::timeout(WRITER_FINISH_WITHIN, writer_task)
             .await
+            .is_err()
         {
-            tracing::error!(error = ?e, source = source.as_str(), "store: insert gap");
+            abort.abort();
+            tracing::error!("store writer did not finish in time; pending writes are lost");
         }
     }
 
@@ -419,9 +502,10 @@ async fn fetch(rest: &PolyRest, req: Request) -> Option<FeedEvent> {
 mod tests {
     use std::collections::HashMap;
 
-    use raki_core::{Asset, StopKind, TradingMode};
+    use raki_core::{StopKind, TradingMode};
     use raki_engine::engine::EngineConfig;
     use raki_feeds::rest::RestUrls;
+    use raki_store::Store;
     use sqlx::Row;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -506,6 +590,11 @@ mod tests {
             id: Uuid::now_v7(),
             started_ms: now_ms(),
         };
+        store
+            .start_session(session.id, session.started_ms, "test", "host")
+            .await
+            .unwrap();
+        let (writer, writer_task) = crate::writer::spawn_writer(store.clone(), session.id);
         let mut engine = Engine::new(
             EngineConfig {
                 assets: vec![Asset::Btc],
@@ -518,6 +607,7 @@ mod tests {
             feeds: FeedStatusRegistry::new(&[(Source::Binance, true)], HashMap::new()),
             state: HealthState::new(50.0),
             recorder: rec.stats(),
+            store: writer.stats(),
         };
         let initial = live_snapshot(&mut engine, &session, &health, 0, now_ms());
         assert_eq!(initial.control.stop_kind, Some(StopKind::Startup));
@@ -526,18 +616,23 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel(4);
         let (desired_tx, _desired_rx) = watch::channel(BTreeSet::new());
         let (live_tx, mut live_rx) = watch::channel(initial);
+        let (sleep_tx, sleep_rx) = mpsc::channel(4);
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(run_engine_loop(
             engine,
-            store.clone(),
+            StoreIo {
+                writer,
+                task: writer_task,
+            },
             rest,
             session.clone(),
             LoopIo {
                 events_tx: events_tx.clone(),
                 events_rx,
                 control_rx,
-                desired_tx,
+                desired_tx: BTreeMap::from([(Asset::Btc, desired_tx)]),
                 live_tx,
+                sleep_rx,
             },
             health,
             shutdown.clone(),
@@ -560,10 +655,17 @@ mod tests {
         })
         .await;
 
-        // Only a reconnect (every reset after the first per source) is a gap.
-        for source in [Source::Binance, Source::Binance, Source::Coinbase] {
+        // Only a reconnect (every reset after the first per source and shard) is a gap.
+        for (source, shard) in [
+            (Source::Binance, None),
+            (Source::Binance, None),
+            (Source::Coinbase, None),
+            (Source::ClobMarket, Some(Asset::Btc)),
+            (Source::ClobMarket, Some(Asset::Eth)),
+            (Source::ClobMarket, Some(Asset::Btc)),
+        ] {
             events_tx
-                .send(FeedEvent::FeedReset { source })
+                .send(FeedEvent::FeedReset { source, shard })
                 .await
                 .unwrap();
         }
@@ -584,6 +686,55 @@ mod tests {
             .await,
             0
         );
+        eventually(|| async {
+            let n = count(
+                &store,
+                "select count(*) from feed_gaps where source = 'clob_market' \
+                 and reason = 'reconnect btc'",
+            )
+            .await;
+            (n == 1).then_some(())
+        })
+        .await;
+        assert_eq!(
+            count(
+                &store,
+                "select count(*) from feed_gaps where source = 'clob_market'"
+            )
+            .await,
+            1,
+            "the eth shard's first connect is not a gap"
+        );
+
+        // A machine sleep becomes a gap with its duration and leaves recorded time.
+        sleep_tx
+            .send(SleepNotice {
+                wake_ms: session.started_ms + 2_000,
+                slept_ms: 1_500,
+            })
+            .await
+            .unwrap();
+        eventually(|| async {
+            let n = count(
+                &store,
+                "select count(*) from feed_gaps where source = 'system' and reason = 'sleep' \
+                 and duration_ms = 1500",
+            )
+            .await;
+            (n == 1).then_some(())
+        })
+        .await;
+        assert_eq!(count(&store, "select slept_ms from sessions").await, 1_500);
+        // The heartbeat dates the session for crash recovery.
+        eventually(|| async {
+            let n = count(
+                &store,
+                "select count(*) from sessions where last_seen_ms is not null",
+            )
+            .await;
+            (n == 1).then_some(())
+        })
+        .await;
 
         let paused = control(
             &control_tx,
@@ -626,10 +777,20 @@ mod tests {
             ]
         );
 
+        // The current window's first upsert carried no coverage yet.
+        let slug = live_rx.borrow().windows[0].slug.clone();
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(3), handle)
             .await
             .unwrap()
             .unwrap();
+        // On shutdown every tracked window is written once more, with its latest coverage.
+        let coverage: i32 = sqlx::query("select coverage_secs from windows where slug = $1")
+            .bind(&slug)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert!(coverage >= 1, "coverage {coverage}");
     }
 }

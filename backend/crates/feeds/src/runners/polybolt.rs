@@ -53,7 +53,8 @@ pub struct PolyboltTiming {
     pub ping: Duration,
     /// How long to wait for `authed`.
     pub auth_timeout: Duration,
-    /// Reconnect when nothing arrives for this long (the server pings every 25 s).
+    /// Reconnect when no price data arrives for this long. Pongs, acks and the server's
+    /// protocol pings do not count: they keep coming while a subscription is dead.
     pub idle_timeout: Duration,
 }
 
@@ -62,7 +63,7 @@ impl Default for PolyboltTiming {
         PolyboltTiming {
             ping: Duration::from_secs(15),
             auth_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -208,7 +209,17 @@ impl Polybolt {
         }
     }
 
-    fn on_text(&self, link: &mut Link<'_>, seq: &mut PolyboltSeq, text: &str, recv_ms: i64) {
+    /// Handles one frame after the subscribe. An error frame ends the connection: the server
+    /// keeps the socket open after `bad_filter`, `sub_limit`, `rate_limited`, `auth_expired`, ...,
+    /// but the subscription it refused would never deliver, so reconnect (with backoff) and
+    /// subscribe again.
+    fn on_text(
+        &self,
+        link: &mut Link<'_>,
+        seq: &mut PolyboltSeq,
+        text: &str,
+        recv_ms: i64,
+    ) -> Option<End> {
         if let Some((channel, n)) = polybolt_seq(text)
             && let Some((expected, got)) = seq.check(&channel, n)
         {
@@ -225,11 +236,18 @@ impl Polybolt {
         match parse_polybolt(text, recv_ms) {
             Ok(PolyboltFrame::Events(events)) => link.forward(Ok(events)),
             Ok(PolyboltFrame::Error { code }) => {
-                tracing::warn!(%code, "PolyBolt error frame");
+                tracing::warn!(%code, "PolyBolt error frame; reconnecting");
+                let end = End::error(format!("error frame: {code}"));
+                return Some(if code == "auth_invalid" {
+                    end.retry(Retry::Max)
+                } else {
+                    end
+                });
             }
             Ok(_) => {}
             Err(e) => link.parse_error(&e),
         }
+        None
     }
 }
 
@@ -279,7 +297,9 @@ impl Session for Polybolt {
             tokio::select! {
                 incoming = link.recv() => match incoming {
                     Incoming::Text { text, recv_ms } => {
-                        self.on_text(link, &mut seq, text.as_str(), recv_ms);
+                        if let Some(end) = self.on_text(link, &mut seq, text.as_str(), recv_ms) {
+                            return end;
+                        }
                     }
                     Incoming::End(end) => return on_end(end),
                 },

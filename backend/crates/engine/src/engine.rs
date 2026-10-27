@@ -13,6 +13,14 @@ use crate::oracle::OracleState;
 use crate::series::WindowPrices;
 use crate::windows::WindowState;
 
+/// A gap this long between two calls means tracking paused (the machine slept, or the loop was
+/// stalled): every window then gets a resume grace before it can time out.
+pub const RESUME_AFTER_GAP_MS: i64 = 10_000;
+
+/// The CLOB tokens to subscribe to, per asset (one CLOB connection per asset). Every configured
+/// asset has an entry, possibly empty.
+pub type DesiredTokens = BTreeMap<Asset, BTreeSet<String>>;
+
 /// A REST call the shell runs; its result comes back as a [`FeedEvent`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -28,8 +36,8 @@ pub enum EngineOutput {
     /// Upsert of the full current record.
     Window(WindowRecord),
     Requests(Vec<Request>),
-    /// The CLOB tokens to stay subscribed to; emitted when the set changes.
-    DesiredTokens(BTreeSet<String>),
+    /// The CLOB tokens to stay subscribed to, per asset; emitted when any set changes.
+    DesiredTokens(DesiredTokens),
     /// A book snapshot disagreed with our delta-built book.
     BookResync {
         asset_id: String,
@@ -51,7 +59,9 @@ pub struct Engine {
     windows: BTreeMap<WindowId, WindowState>,
     control: Control,
     book_resyncs: u32,
-    desired: BTreeSet<String>,
+    desired: DesiredTokens,
+    /// The latest `now_ms` seen by `handle` or `tick`, to notice a pause.
+    last_seen_ms: Option<i64>,
 }
 
 impl Engine {
@@ -64,11 +74,51 @@ impl Engine {
             windows: BTreeMap::new(),
             control: Control::new(now_ms),
             book_resyncs: 0,
-            desired: BTreeSet::new(),
+            desired: DesiredTokens::new(),
+            last_seen_ms: None,
         }
     }
 
+    /// Resumes tracking a window an earlier session left unfinished (from the store). Its latched
+    /// fields are kept, and it gets at least the resume grace of polling. Ignored for an asset
+    /// that is not configured, a malformed slug, or a window already tracked.
+    pub fn adopt(&mut self, rec: WindowRecord, now_ms: i64) {
+        let Some(id) = WindowId::parse_slug(&rec.slug) else {
+            tracing::warn!(slug = %rec.slug, "cannot adopt a window with a malformed slug");
+            return;
+        };
+        if !self.cfg.assets.contains(&id.asset) {
+            return;
+        }
+        self.windows
+            .entry(id)
+            .or_insert_with(|| WindowState::adopt(id, rec, now_ms));
+    }
+
+    /// Every tracked window's current record, for a final write at shutdown (it carries the
+    /// coverage counted since the last upsert).
+    pub fn records(&self) -> Vec<WindowRecord> {
+        self.windows.values().map(|w| w.rec.clone()).collect()
+    }
+
+    /// Notices a pause (sleep, stall): every window then gets a resume grace.
+    fn observe(&mut self, now_ms: i64) {
+        if let Some(prev) = self.last_seen_ms
+            && now_ms - prev > RESUME_AFTER_GAP_MS
+        {
+            tracing::info!(
+                paused_ms = now_ms - prev,
+                "tracking resumed after a pause; windows get a polling grace"
+            );
+            for w in self.windows.values_mut() {
+                w.resume(now_ms);
+            }
+        }
+        self.last_seen_ms = Some(self.last_seen_ms.map_or(now_ms, |p| p.max(now_ms)));
+    }
+
     pub fn handle(&mut self, ev: FeedEvent, now_ms: i64) -> Vec<EngineOutput> {
+        self.observe(now_ms);
         let mut out = vec![];
         match ev {
             FeedEvent::Book {
@@ -93,9 +143,23 @@ impl Engine {
                     }
                 }
             }
+            // A reconnect's books are stale until its fresh snapshots arrive. A shard's reset
+            // clears only its own asset's books: the other shards' deltas keep flowing.
             FeedEvent::FeedReset {
                 source: Source::ClobMarket,
-            } => self.books.clear(),
+                shard,
+            } => match shard {
+                None => self.books.clear(),
+                Some(asset) => {
+                    let tokens: BTreeSet<&String> = self
+                        .windows
+                        .values()
+                        .filter(|w| w.id.asset == asset)
+                        .flat_map(|w| w.tokens())
+                        .collect();
+                    self.books.retain(|id, _| !tokens.contains(id));
+                }
+            },
             FeedEvent::Oracle {
                 asset,
                 kind,
@@ -184,6 +248,7 @@ impl Engine {
 
     /// Called once per second.
     pub fn tick(&mut self, now_ms: i64) -> Vec<EngineOutput> {
+        self.observe(now_ms);
         let now_s = now_ms.div_euclid(1000);
         for &asset in &self.cfg.assets {
             let current = WindowId::containing(asset, now_s);
@@ -286,15 +351,21 @@ impl Engine {
         }
         self.windows.retain(|_, w| !w.droppable(now_ms));
 
-        let desired: BTreeSet<String> = self
-            .windows
-            .values()
-            .filter(|w| w.wants_tokens())
-            .flat_map(|w| w.tokens().cloned())
+        let mut desired: DesiredTokens = self
+            .cfg
+            .assets
+            .iter()
+            .map(|&a| (a, BTreeSet::new()))
             .collect();
+        for w in self.windows.values().filter(|w| w.wants_tokens()) {
+            if let Some(set) = desired.get_mut(&w.id.asset) {
+                set.extend(w.tokens().cloned());
+            }
+        }
         if desired != self.desired {
             // An unsubscribed token's book would only go stale.
-            self.books.retain(|asset_id, _| desired.contains(asset_id));
+            self.books
+                .retain(|asset_id, _| desired.values().any(|set| set.contains(asset_id)));
             self.desired = desired.clone();
             out.push(EngineOutput::DesiredTokens(desired));
         }
@@ -326,7 +397,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
-    use crate::windows::GIVE_UP_MS;
+    use crate::windows::{GIVE_UP_MS, RESUME_GRACE_MS};
 
     const START: i64 = 1793031000;
     const NEXT: i64 = START + 300;
@@ -439,9 +510,10 @@ mod tests {
             .collect()
     }
 
+    /// The BTC set of the latest desired-tokens output.
     fn desired(out: &[EngineOutput]) -> Option<BTreeSet<String>> {
         out.iter().rev().find_map(|o| match o {
-            EngineOutput::DesiredTokens(t) => Some(t.clone()),
+            EngineOutput::DesiredTokens(t) => Some(t[&Asset::Btc].clone()),
             _ => None,
         })
     }
@@ -847,6 +919,7 @@ mod tests {
         e.handle(
             FeedEvent::FeedReset {
                 source: Source::Binance,
+                shard: None,
             },
             START_MS + 2100,
         );
@@ -855,6 +928,7 @@ mod tests {
         e.handle(
             FeedEvent::FeedReset {
                 source: Source::ClobMarket,
+                shard: None,
             },
             START_MS + 2200,
         );
@@ -869,6 +943,172 @@ mod tests {
                 .any(|o| matches!(o, EngineOutput::BookResync { .. }))
         );
         assert_eq!(e.book_resyncs(), 0);
+    }
+
+    fn eth_gamma(start: i64) -> FeedEvent {
+        let FeedEvent::GammaFetched {
+            window: Some(mut w),
+            ..
+        } = gamma(start, None)
+        else {
+            unreachable!()
+        };
+        w.slug = format!("eth-updown-5m-{start}");
+        w.up_token = format!("eth-up-{start}");
+        w.down_token = format!("eth-down-{start}");
+        w.condition_id = format!("eth-cond-{start}");
+        FeedEvent::GammaFetched {
+            slug: w.slug.clone(),
+            window: Some(w),
+            recv_ms: 0,
+        }
+    }
+
+    fn two_asset_engine() -> Engine {
+        let mut e = Engine::new(
+            EngineConfig {
+                assets: vec![Asset::Btc, Asset::Eth],
+                session_id: "session-1".into(),
+            },
+            START_MS,
+        );
+        e.tick(START_MS + 1000);
+        e.handle(gamma(START, None), START_MS + 1100);
+        e.handle(eth_gamma(START), START_MS + 1100);
+        e
+    }
+
+    #[test]
+    fn desired_tokens_are_split_per_asset() {
+        let mut e = Engine::new(
+            EngineConfig {
+                assets: vec![Asset::Btc, Asset::Eth],
+                session_id: "session-1".into(),
+            },
+            START_MS,
+        );
+        e.tick(START_MS + 1000);
+        let out = e.handle(eth_gamma(START), START_MS + 1100);
+        let all = out
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                EngineOutput::DesiredTokens(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("desired tokens");
+        assert_eq!(
+            all,
+            DesiredTokens::from([
+                (Asset::Btc, BTreeSet::new()),
+                (
+                    Asset::Eth,
+                    BTreeSet::from([format!("eth-up-{START}"), format!("eth-down-{START}")])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn clob_shard_reset_clears_only_that_assets_books() {
+        let mut e = two_asset_engine();
+        e.handle(book(&up(START), "0.55", "0.57"), START_MS + 2000);
+        e.handle(
+            book(&format!("eth-up-{START}"), "0.40", "0.42"),
+            START_MS + 2000,
+        );
+        e.handle(
+            FeedEvent::FeedReset {
+                source: Source::ClobMarket,
+                shard: Some(Asset::Eth),
+            },
+            START_MS + 2100,
+        );
+        assert!(e.books.contains_key(&up(START)), "btc book kept");
+        assert!(!e.books.contains_key(&format!("eth-up-{START}")));
+    }
+
+    #[test]
+    fn adopted_window_keeps_latched_fields_and_completes() {
+        // Session A recorded the price to beat and the final TWAP, then stopped before Gamma's
+        // final price arrived. Session B adopts the row long after the normal give-up.
+        let mut stored = record(&discovered(None), START);
+        stored.price_to_beat_ours = Some(100.0);
+        stored.twap_source = Some(Source::Polybolt);
+        stored.final_twap_ours = Some(100.25);
+        stored.final_twap_source = Some(Source::Polybolt);
+        stored.outcome_ours = Some(Outcome::Up);
+        stored.winner = Some(Outcome::Up);
+        stored.status = WindowStatus::TimedOut;
+        stored.coverage_secs = 120;
+        let later = END_MS + 2 * GIVE_UP_MS;
+
+        let mut e = engine();
+        e.adopt(stored.clone(), later);
+        let out = e.tick(later);
+        assert!(
+            requests(&out).contains(&fetch_gamma(START)),
+            "the adopted window is polled at once"
+        );
+        let rec = record(&e, START);
+        assert_eq!(rec.price_to_beat_ours, Some(100.0), "latched, not reset");
+        assert_eq!(rec.twap_source, Some(Source::Polybolt));
+        assert_eq!(
+            rec.status,
+            WindowStatus::Resolved,
+            "in its grace, not timed out"
+        );
+        assert_eq!(rec.coverage_secs, 120);
+
+        let out = e.handle(gamma(START, Some(100.25)), later + 500);
+        let w = window_outputs(&out, START).pop().expect("completed");
+        assert_eq!(w.twap_match, Some(true));
+        assert_eq!(w.status, WindowStatus::Complete);
+        assert_eq!(w.session_id, stored.session_id);
+
+        // Adopting a window that is already tracked changes nothing.
+        let mut other = stored.clone();
+        other.price_to_beat_ours = Some(1.0);
+        e.adopt(other, later + 600);
+        assert_eq!(record(&e, START).price_to_beat_ours, Some(100.0));
+    }
+
+    #[test]
+    fn wake_after_long_sleep_polls_before_timing_out() {
+        let mut e = discovered(None);
+        e.tick(END_MS - 1000);
+        // Asleep for an hour: the first tick after the wake must poll, not time out.
+        let wake = END_MS + 60 * 60_000;
+        let out = e.tick(wake);
+        let reqs = requests(&out);
+        assert!(reqs.contains(&fetch_gamma(START)), "{reqs:?}");
+        assert!(reqs.contains(&fetch_resolution(START)), "{reqs:?}");
+        assert_ne!(record(&e, START).status, WindowStatus::TimedOut);
+
+        let out = e.handle(
+            FeedEvent::Resolution {
+                condition_id: cond(START),
+                winner: Some(Outcome::Down),
+                resolved_at: None,
+            },
+            wake + 1_000,
+        );
+        assert_eq!(
+            window_outputs(&out, START).pop().unwrap().winner,
+            Some(Outcome::Down)
+        );
+        // Without a Gamma final it times out once the grace is over.
+        for now in (wake + 2_000..=wake + RESUME_GRACE_MS).step_by(1000) {
+            e.tick(now);
+        }
+        assert_eq!(record(&e, START).status, WindowStatus::TimedOut);
+    }
+
+    #[test]
+    fn records_lists_every_tracked_window() {
+        let e = discovered(None);
+        let slugs: Vec<String> = e.records().into_iter().map(|r| r.slug).collect();
+        assert_eq!(slugs, vec![slug(START), slug(NEXT)]);
     }
 
     #[test]

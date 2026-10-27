@@ -123,9 +123,11 @@ pub enum FeedEvent {
         price: Decimal,
         recv_ms: i64,
     },
-    /// Emitted by a runner on every (re)connect.
+    /// Emitted by a runner on every (re)connect. `shard` names the asset of a feed that runs one
+    /// connection per asset (the CLOB); `None` for unsharded feeds.
     FeedReset {
         source: Source,
+        shard: Option<Asset>,
     },
     /// `window: None` means Gamma answered 404.
     GammaFetched {

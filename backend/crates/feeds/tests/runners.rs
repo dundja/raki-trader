@@ -229,8 +229,26 @@ fn spawn_clob_with(
     backoff: Backoff,
     timing: ClobTiming,
 ) -> (watch::Sender<BTreeSet<String>>, JoinHandle<()>) {
+    spawn_clob_shard(ctx, url, None, desired, backoff, timing)
+}
+
+fn spawn_clob_shard(
+    ctx: FeedCtx,
+    url: &str,
+    shard: Option<Asset>,
+    desired: &[&str],
+    backoff: Backoff,
+    timing: ClobTiming,
+) -> (watch::Sender<BTreeSet<String>>, JoinHandle<()>) {
     let (tx, rx) = watch::channel(set(desired));
-    let runner = tokio::spawn(run_clob_with(ctx, url.to_owned(), rx, backoff, timing));
+    let runner = tokio::spawn(run_clob_with(
+        ctx,
+        url.to_owned(),
+        shard,
+        rx,
+        backoff,
+        timing,
+    ));
     (tx, runner)
 }
 
@@ -352,6 +370,7 @@ async fn clob_reconnects_and_resubscribes_after_server_close() {
 
     let reset = FeedEvent::FeedReset {
         source: Source::ClobMarket,
+        shard: None,
     };
     assert_eq!(h.next_event().await, reset);
     assert!(matches!(h.next_event().await, FeedEvent::Book { .. }));
@@ -441,7 +460,8 @@ async fn raw_text_recorded_before_parse_even_if_garbage() {
     assert_eq!(
         h.next_event().await,
         FeedEvent::FeedReset {
-            source: Source::ClobMarket
+            source: Source::ClobMarket,
+            shard: None,
         }
     );
     assert!(
@@ -655,7 +675,7 @@ async fn rtds_reconnects_when_stale() {
     let mut ws = srv.accept().await;
     next_json(&mut ws).await;
     let _ws2 = srv.accept().await;
-    assert!(h.record_of(RecordKind::Error).await.d.contains("no frames"));
+    assert!(h.record_of(RecordKind::Error).await.d.contains("no data"));
     drop(ws);
 
     h.stop(runner).await;
@@ -731,7 +751,16 @@ async fn status_marks_stale_and_counts_reconnects() {
     let (_desired, runner) = spawn_clob(ctx, &srv.url, &[], ClobTiming::default());
 
     let mut ws = srv.accept().await;
+    // A PONG is a control frame: it neither counts as a message nor makes the feed fresh.
     send_text(&mut ws, "PONG").await;
+    h.record_of(RecordKind::Text).await;
+    let live = h.status.snapshot(raki_core::now_ms());
+    let clob = live
+        .iter()
+        .find(|f| f.source == Source::ClobMarket)
+        .unwrap();
+    assert!(clob.connected && clob.stale && clob.msgs_total == 0);
+    send_text(&mut ws, BOOK).await;
     h.record_of(RecordKind::Text).await;
     let live = h.status.snapshot(raki_core::now_ms());
     let clob = live
@@ -761,6 +790,230 @@ async fn status_marks_stale_and_counts_reconnects() {
     h.stop(runner).await;
 }
 
+#[tokio::test]
+async fn clob_reconnects_fast_after_slow_consumer_close_1013() {
+    let (ctx, mut h) = harness();
+    let srv = server().await;
+    let timing = ClobTiming {
+        clean_close_delay: ms(20),
+        ..ClobTiming::default()
+    };
+    // A slow backoff: only the fast path reconnects within the deadlines below.
+    let backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(5));
+    let (_desired, runner) = spawn_clob_with(ctx, &srv.url, &["a"], backoff, timing);
+
+    // Two 1013 closes in a row (less than the 60 s that resets the backoff): both reconnect
+    // fast, so the backoff does not grow.
+    for _ in 0..2 {
+        let mut ws = srv.accept().await;
+        next_json(&mut ws).await;
+        send_text(&mut ws, BOOK).await;
+        ws.close(Some(CloseFrame {
+            code: CloseCode::Again,
+            reason: "slow consumer: send buffer full".into(),
+        }))
+        .await
+        .unwrap();
+        let close = h.record_of(RecordKind::Close).await;
+        assert!(close.d.contains("1013"), "close record: {}", close.d);
+    }
+    let (tcp, _) = timeout(ms(500), srv.listener.accept())
+        .await
+        .expect("no fast reconnect after a 1013 close")
+        .unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    assert_eq!(ids(&next_json(&mut ws).await), set(&["a"]));
+    let snap = h.status.snapshot(raki_core::now_ms());
+    let clob = snap
+        .iter()
+        .find(|f| f.source == Source::ClobMarket)
+        .unwrap();
+    assert!(
+        clob.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("1013")),
+        "{clob:?}"
+    );
+
+    h.stop(runner).await;
+}
+
+#[tokio::test]
+async fn clob_reconnects_when_data_stops_although_pongs_continue() {
+    let (ctx, mut h) = harness();
+    let srv = server().await;
+    let timing = ClobTiming {
+        ping: ms(30),
+        pong_timeout: ms(1_000),
+        data_timeout: ms(200),
+        ..ClobTiming::default()
+    };
+    let (_desired, runner) = spawn_clob(ctx, &srv.url, &["a"], timing);
+
+    let mut ws = srv.accept().await;
+    next_json(&mut ws).await;
+    send_text(&mut ws, BOOK).await;
+    // Keep answering PINGs but never send data again.
+    let responder = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg == Message::text("PING") && ws.send(Message::text("PONG")).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut ws2 = srv.accept().await;
+    assert_eq!(ids(&next_json(&mut ws2).await), set(&["a"]));
+    let err = h.record_of(RecordKind::Error).await;
+    assert!(err.d.contains("no data"), "error record: {}", err.d);
+
+    h.stop(runner).await;
+    responder.abort();
+}
+
+#[tokio::test]
+async fn clob_shard_tags_its_reset_and_numbers_its_connections() {
+    let (ctx, mut h) = harness();
+    let srv = server().await;
+    let (_desired, runner) = spawn_clob_shard(
+        ctx,
+        &srv.url,
+        Some(Asset::Eth),
+        &["a"],
+        fast_backoff(),
+        ClobTiming::default(),
+    );
+
+    let mut ws = srv.accept().await;
+    next_json(&mut ws).await;
+    assert_eq!(
+        h.next_event().await,
+        FeedEvent::FeedReset {
+            source: Source::ClobMarket,
+            shard: Some(Asset::Eth),
+        }
+    );
+    let open = h.record_of(RecordKind::Open).await;
+    assert_eq!(
+        open.c, 2_000_001,
+        "eth is shard 1: connections from 2_000_001"
+    );
+
+    h.stop(runner).await;
+}
+
+#[tokio::test]
+async fn dropped_events_are_counted_in_the_feed_status() {
+    ensure_crypto();
+    let (rec_tx, _rec_rx) = record_channel(4096);
+    // Room for the FeedReset only.
+    let (ev_tx, _ev_rx) = mpsc::channel(1);
+    let status = FeedStatusRegistry::new(&[(Source::ClobMarket, true)], HashMap::new());
+    let (_reconnect_tx, reconnect_rx) = broadcast::channel(4);
+    let shutdown = CancellationToken::new();
+    let ctx = FeedCtx {
+        rec: rec_tx,
+        events: ev_tx,
+        status: status.clone(),
+        reconnect: reconnect_rx,
+        shutdown: shutdown.clone(),
+    };
+    let srv = server().await;
+    let (_desired, runner) = spawn_clob(ctx, &srv.url, &[], ClobTiming::default());
+    let mut ws = srv.accept().await;
+    send_text(&mut ws, BOOK).await;
+    send_text(&mut ws, BOOK).await;
+
+    let mut dropped = 0;
+    for _ in 0..100 {
+        let snap = status.snapshot(raki_core::now_ms());
+        dropped = snap[0].events_dropped_recent;
+        if dropped == 2 {
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    assert_eq!(dropped, 2);
+
+    shutdown.cancel();
+    timeout(WAIT, runner).await.unwrap().unwrap();
+}
+
+fn spawn_polybolt(ctx: FeedCtx, url: &str, timing: PolyboltTiming) -> JoinHandle<()> {
+    tokio::spawn(run_polybolt_with(
+        ctx,
+        url.to_owned(),
+        creds(),
+        vec![Asset::Btc],
+        fast_backoff(),
+        timing,
+    ))
+}
+
+/// Accepts, answers the auth and reads the subscribe.
+async fn polybolt_session(srv: &Server) -> Ws {
+    let mut ws = srv.accept().await;
+    next_text(&mut ws).await;
+    send_text(&mut ws, r#"{"op":"authed","rid":"a1"}"#).await;
+    assert_eq!(next_json(&mut ws).await["op"], "subscribe");
+    ws
+}
+
+#[tokio::test]
+async fn polybolt_error_frame_after_subscribe_reconnects() {
+    let (ctx, mut h) = harness();
+    let srv = server().await;
+    let runner = spawn_polybolt(ctx, &srv.url, PolyboltTiming::default());
+
+    let mut ws = polybolt_session(&srv).await;
+    // The server keeps the socket open after a refused subscription; we must not.
+    send_text(
+        &mut ws,
+        r#"{"op":"error","channel":"price.crypto.twap","rid":"s1","code":"sub_limit"}"#,
+    )
+    .await;
+    let err = h.record_of(RecordKind::Error).await;
+    assert!(err.d.contains("sub_limit"), "error record: {}", err.d);
+    let _ws2 = polybolt_session(&srv).await;
+
+    h.stop(runner).await;
+}
+
+#[tokio::test]
+async fn polybolt_reconnects_when_only_pongs_arrive() {
+    let (ctx, mut h) = harness();
+    let srv = server().await;
+    let timing = PolyboltTiming {
+        ping: ms(30),
+        idle_timeout: ms(200),
+        ..PolyboltTiming::default()
+    };
+    let runner = spawn_polybolt(ctx, &srv.url, timing);
+
+    let mut ws = polybolt_session(&srv).await;
+    let responder = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(t))) = ws.next().await {
+            if t.contains(r#""op":"ping""#)
+                && ws
+                    .send(Message::text(r#"{"op":"pong","rid":"p"}"#))
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let _ws2 = polybolt_session(&srv).await;
+    let err = h.record_of(RecordKind::Error).await;
+    assert!(err.d.contains("no data"), "error record: {}", err.d);
+    let snap = h.status.snapshot(raki_core::now_ms());
+    let pb = snap.iter().find(|f| f.source == Source::Polybolt).unwrap();
+    assert_eq!(pb.msgs_total, 0, "pongs are not data");
+
+    h.stop(runner).await;
+    responder.abort();
+}
+
 /// Runs the real feeds for 8 s. Needs network access:
 /// `cargo test -p raki-feeds --test runners -- --ignored live_feeds_smoke`.
 #[tokio::test]
@@ -786,6 +1039,7 @@ async fn live_feeds_smoke() {
         tokio::spawn(run_clob(
             ctx(),
             "wss://ws-subscriptions-clob.polymarket.com/ws/market".into(),
+            None,
             desired_rx,
         )),
         tokio::spawn(run_rtds_legacy(

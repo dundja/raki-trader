@@ -4,18 +4,24 @@
 //! 1. Connect, then record `Open` (d = the URL, which never carries secrets), mark the feed
 //!    connected and emit [`FeedEvent::FeedReset`].
 //! 2. Send the feed's subscribe or auth frames, recording each as `Send`.
-//! 3. For every text frame: record `Text` with the exact text **first**, update the status, then
-//!    parse and forward the events with `try_send`. Parse errors are logged and counted, never
-//!    fatal.
+//! 3. For every text frame: record `Text` with the exact text **first**, then parse and forward
+//!    the events with `try_send`. Parse errors are logged and counted, never fatal. Only frames
+//!    that carry data (yield events) refresh the feed status and the idle deadline: pongs,
+//!    heartbeats and acks do not, so a socket whose subscriptions stopped delivering goes stale
+//!    and reconnects even while its heartbeat keeps answering.
 //! 4. When the connection ends, record `Close` or `Error`, then `Gap`, mark the feed
 //!    disconnected, wait for the backoff and reconnect. The backoff resets after 60 s connected.
 //!    A `reconnect` broadcast (sleep/wake) drops the socket and reconnects at once.
+//!
+//! A sharded feed (the CLOB, one connection per asset) runs one runner per shard. Shard `k`
+//! numbers its connections from `k * 1_000_000 + 1`, so `(s, c)` still names one connection in
+//! the raw files, and its `FeedReset` carries the shard.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use raki_core::{FeedEvent, Source};
+use raki_core::{Asset, FeedEvent, Source};
 use raki_recorder::{Record, RecordKind, RecordTx};
 use serde_json::json;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -142,8 +148,12 @@ pub(crate) trait Session {
     const SOURCE: Source;
     /// Where to connect. It never carries secrets, so it is also the `Open` record's `d`.
     fn url(&self) -> &str;
-    /// Reconnect when no frame at all (data or control) arrives for this long.
+    /// Reconnect when no data frame arrives for this long. Control frames do not count.
     fn idle_timeout(&self) -> Option<Duration>;
+    /// The asset this runner covers when the feed is sharded per asset.
+    fn shard(&self) -> Option<Asset> {
+        None
+    }
     /// Drives one open connection until it ends.
     async fn run(&mut self, link: &mut Link<'_>) -> End;
 }
@@ -195,10 +205,14 @@ impl Runner {
     }
 
     /// Never blocks: with the engine behind, events are dropped (the raw frames are recorded).
+    /// Drops are counted in the feed status, which fails the safety checks while they last.
     fn emit(&mut self, ev: FeedEvent) {
         match self.ctx.events.try_send(ev) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.ctx
+                    .status
+                    .on_event_dropped(self.source, raki_core::now_ms());
                 if let Some(dropped) = self.events_full.hit() {
                     tracing::warn!(
                         source = self.source.as_str(),
@@ -215,7 +229,7 @@ impl Runner {
     fn connect_failed(&mut self, err: String) {
         tracing::warn!(source = self.source.as_str(), error = %err, "connect failed");
         self.record(RecordKind::Error, json!({ "error": err }).to_string());
-        self.ctx.status.on_disconnected(self.source, Some(err));
+        self.ctx.status.on_connect_failed(self.source, err);
     }
 
     /// Records how the connection ended. `None` means shut down.
@@ -225,7 +239,7 @@ impl Runner {
             Ended::Shutdown => {
                 let d = json!({ "code": null, "reason": "shutdown" });
                 self.record(RecordKind::Close, d.to_string());
-                self.ctx.status.on_disconnected(self.source, None);
+                self.ctx.status.on_stopped(self.source);
                 tracing::info!(source, "feed stopped");
                 return None;
             }
@@ -259,8 +273,11 @@ impl Runner {
 pub(crate) struct Link<'a> {
     ws: WsStream,
     rt: &'a mut Runner,
+    /// Reconnect when no data frame arrives for this long.
     idle: Option<Duration>,
-    last_frame: Instant,
+    last_data: Instant,
+    /// Receive time of the latest text frame.
+    last_recv_ms: i64,
     texts: u64,
 }
 
@@ -268,6 +285,21 @@ impl Link<'_> {
     /// Text frames received on this connection.
     pub(crate) fn texts(&self) -> u64 {
         self.texts
+    }
+
+    /// Changes the data-idle deadline, counting from now.
+    pub(crate) fn set_idle_timeout(&mut self, idle: Option<Duration>) {
+        self.idle = idle;
+        self.last_data = Instant::now();
+    }
+
+    /// The latest text frame carried data: the feed is fresh and the idle deadline restarts.
+    pub(crate) fn mark_data(&mut self) {
+        self.last_data = Instant::now();
+        self.rt
+            .ctx
+            .status
+            .on_message(self.rt.source, self.last_recv_ms);
     }
 
     pub(crate) fn record(&self, k: RecordKind, d: String) {
@@ -293,12 +325,13 @@ impl Link<'_> {
             .map_err(|e| End::error(format!("send failed: {e}")))
     }
 
-    /// The next text frame, or why the connection ended. The frame is recorded and counted
-    /// before it is returned. Control frames are absorbed (tungstenite answers pings).
+    /// The next text frame, or why the connection ended. The frame is recorded before it is
+    /// returned. WebSocket control frames are absorbed (tungstenite answers pings). Whether a text
+    /// frame is data is up to the session ([`Link::forward`] / [`Link::mark_data`]).
     /// Cancel-safe.
     pub(crate) async fn recv(&mut self) -> Incoming {
         loop {
-            let idle_deadline = self.idle.map(|d| self.last_frame + d);
+            let idle_deadline = self.idle.map(|d| self.last_data + d);
             let msg = tokio::select! {
                 biased;
                 () = self.rt.ctx.shutdown.cancelled() => return Incoming::End(End::shutdown()),
@@ -309,17 +342,16 @@ impl Link<'_> {
                 msg = self.ws.next() => msg,
                 () = sleep_until_opt(idle_deadline) => {
                     let idle = self.idle.unwrap_or_default();
-                    return Incoming::End(End::error(format!("no frames for {idle:?}")));
+                    return Incoming::End(End::error(format!("no data for {idle:?}")));
                 }
             };
-            self.last_frame = Instant::now();
             match msg {
                 Some(Ok(Message::Text(text))) => {
                     let recv_ns = raki_core::now_ns();
                     self.rt
                         .record_at(recv_ns, RecordKind::Text, text.as_str().to_owned());
                     let recv_ms = recv_ns / 1_000_000;
-                    self.rt.ctx.status.on_message(self.rt.source, recv_ms);
+                    self.last_recv_ms = recv_ms;
                     self.texts += 1;
                     return Incoming::Text { text, recv_ms };
                 }
@@ -344,10 +376,17 @@ impl Link<'_> {
         }
     }
 
-    /// Forwards parsed events, or logs and counts the parse error.
+    /// Forwards parsed events, or logs and counts the parse error. A frame that yields events is
+    /// data ([`Link::mark_data`]); one that yields none (a pong, a heartbeat, an ack, an untracked
+    /// symbol) is not.
     pub(crate) fn forward(&mut self, parsed: Result<Vec<FeedEvent>, ParseError>) {
         match parsed {
-            Ok(events) => events.into_iter().for_each(|ev| self.rt.emit(ev)),
+            Ok(events) => {
+                if !events.is_empty() {
+                    self.mark_data();
+                }
+                events.into_iter().for_each(|ev| self.rt.emit(ev));
+            }
             Err(e) => self.parse_error(&e),
         }
     }
@@ -396,10 +435,16 @@ pub(crate) fn heartbeat(period: Duration) -> Interval {
 
 /// The connect/record/backoff loop shared by every runner. Returns on shutdown.
 pub(crate) async fn run_session<S: Session>(ctx: FeedCtx, mut session: S, mut backoff: Backoff) {
+    let shard = session.shard();
+    // Shard k numbers its connections from k * 1_000_000 + 1.
+    let conn_base = shard.map_or(0, |a| {
+        let k = Asset::ALL.iter().position(|&x| x == a).unwrap_or(0) as u32;
+        (k + 1) * 1_000_000
+    });
     let mut rt = Runner {
         ctx,
         source: S::SOURCE,
-        conn: 0,
+        conn: conn_base,
         parse_errors: 0,
         parse_warn: Throttle::default(),
         events_full: Throttle::default(),
@@ -417,9 +462,13 @@ pub(crate) async fn run_session<S: Session>(ctx: FeedCtx, mut session: S, mut ba
                 drain_reconnects(&mut rt.ctx.reconnect);
                 rt.record(RecordKind::Open, url);
                 rt.ctx.status.on_connected(S::SOURCE);
-                rt.emit(FeedEvent::FeedReset { source: S::SOURCE });
+                rt.emit(FeedEvent::FeedReset {
+                    source: S::SOURCE,
+                    shard,
+                });
                 tracing::info!(
                     source = S::SOURCE.as_str(),
+                    shard = shard.map(Asset::as_str),
                     conn = rt.conn,
                     "feed connected"
                 );
@@ -428,7 +477,8 @@ pub(crate) async fn run_session<S: Session>(ctx: FeedCtx, mut session: S, mut ba
                     ws,
                     rt: &mut rt,
                     idle: session.idle_timeout(),
-                    last_frame: since,
+                    last_data: since,
+                    last_recv_ms: 0,
                     texts: 0,
                 };
                 let end = session.run(&mut link).await;

@@ -136,6 +136,7 @@ mod tests {
             clock_ok: true,
             geoblock_ok: true,
             recorder_ok: true,
+            store_ok: true,
             all_ok: true,
             reasons: vec![],
         }

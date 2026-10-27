@@ -12,7 +12,7 @@ use raki_api::{AppState, ControlCommand, ControlMsg, router};
 use raki_core::{
     Asset, ClockStatus, ControlResponse, ControlState, FeedStatusDto, GeoStatus, HealthSnapshot,
     LiveSnapshot, RecorderStatus, SafetyChecks, SeriesRow, SessionInfo, Source, StopKind,
-    TradingMode, WindowRecord, WindowStatus,
+    StoreStatus, TradingMode, WindowRecord, WindowStatus,
 };
 use raki_store::Store;
 use rust_decimal::Decimal;
@@ -103,6 +103,8 @@ fn snapshot(generated_ms: i64) -> LiveSnapshot {
                 reconnects: 0,
                 last_error: None,
                 stale: false,
+                events_dropped: 0,
+                events_dropped_recent: 0,
             }],
             clock: ClockStatus {
                 offset_ms: Some(1.0),
@@ -122,6 +124,13 @@ fn snapshot(generated_ms: i64) -> LiveSnapshot {
                 dropped: 0,
                 last_flush_ms: None,
             },
+            store: StoreStatus {
+                ok: true,
+                pending_writes: 0,
+                dropped_writes: 0,
+                last_ok_ms: Some(generated_ms),
+                last_error: None,
+            },
             sleep_events: 0,
             book_resyncs: 0,
             safety: SafetyChecks {
@@ -129,6 +138,7 @@ fn snapshot(generated_ms: i64) -> LiveSnapshot {
                 clock_ok: true,
                 geoblock_ok: true,
                 recorder_ok: true,
+                store_ok: true,
                 all_ok: true,
                 reasons: vec![],
             },
@@ -158,6 +168,7 @@ fn window(slug: &str, asset: Asset, start_ts: i64) -> WindowRecord {
         resolved_at: None,
         resolution_seen_ms: None,
         twap_source: None,
+        final_twap_source: None,
         coverage_secs: 10,
         status: WindowStatus::Live,
         session_id: Uuid::nil().to_string(),

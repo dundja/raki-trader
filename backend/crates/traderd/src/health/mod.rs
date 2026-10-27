@@ -5,8 +5,13 @@ pub mod geoblock;
 pub mod sleep;
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use raki_core::{ClockStatus, FeedStatusDto, GeoStatus, RecorderStatus, SafetyChecks, now_ms};
+use raki_core::{
+    ClockStatus, FeedStatusDto, GeoStatus, RecorderStatus, SafetyChecks, StoreStatus, now_ms,
+};
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
 /// The recorder must have flushed within this window for `recorder_ok`.
 const MAX_FLUSH_AGE_MS: i64 = 5_000;
@@ -15,6 +20,33 @@ struct Inner {
     clock: ClockStatus,
     geo: GeoStatus,
     sleep_events: u32,
+    /// A clock or geoblock result older than this is treated as unknown.
+    max_ages: MaxAges,
+}
+
+/// How old a monitor result may be before the safety checks stop trusting it: twice the
+/// monitor's interval. A result from before a sleep, or from a monitor that died, must not keep
+/// passing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaxAges {
+    pub clock_ms: i64,
+    pub geo_ms: i64,
+}
+
+impl MaxAges {
+    pub fn from_intervals(clock: Duration, geo: Duration) -> Self {
+        MaxAges {
+            clock_ms: 2 * clock.as_millis() as i64,
+            geo_ms: 2 * geo.as_millis() as i64,
+        }
+    }
+}
+
+impl Default for MaxAges {
+    /// For the default 60 s clock and 300 s geoblock intervals.
+    fn default() -> Self {
+        MaxAges::from_intervals(Duration::from_secs(60), Duration::from_secs(300))
+    }
 }
 
 /// Latest results of the monitors. Written by the monitor tasks, read by the health snapshot.
@@ -38,8 +70,17 @@ impl HealthState {
                     checked_ms: None,
                 },
                 sleep_events: 0,
+                max_ages: MaxAges::default(),
             }),
         })
+    }
+
+    pub fn set_max_ages(&self, max_ages: MaxAges) {
+        self.lock().max_ages = max_ages;
+    }
+
+    pub fn max_ages(&self) -> MaxAges {
+        self.lock().max_ages
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -95,25 +136,48 @@ pub fn median_offset_ms(samples: &[f64]) -> Option<f64> {
     })
 }
 
-/// Rolls the individual health facts up into the checks that gate trading.
-pub fn safety(
-    feeds: &[FeedStatusDto],
-    clock: &ClockStatus,
-    geo: &GeoStatus,
-    rec: &RecorderStatus,
-    rec_dropped_last_min: u64,
-) -> SafetyChecks {
-    safety_at(now_ms(), feeds, clock, geo, rec, rec_dropped_last_min)
+/// Resolves when the machine woke from sleep (the sleep monitor's reconnect broadcast). A lagged
+/// receiver still counts; a closed channel never fires.
+pub async fn woke(rx: &mut broadcast::Receiver<()>) {
+    match rx.recv().await {
+        Ok(()) | Err(RecvError::Lagged(_)) => {}
+        Err(RecvError::Closed) => std::future::pending().await,
+    }
 }
 
-fn safety_at(
-    now_ms: i64,
-    feeds: &[FeedStatusDto],
-    clock: &ClockStatus,
-    geo: &GeoStatus,
-    rec: &RecorderStatus,
-    rec_dropped_last_min: u64,
-) -> SafetyChecks {
+/// Everything the safety roll-up looks at.
+#[derive(Clone, Copy)]
+pub struct SafetyInputs<'a> {
+    pub feeds: &'a [FeedStatusDto],
+    pub clock: &'a ClockStatus,
+    pub geo: &'a GeoStatus,
+    pub rec: &'a RecorderStatus,
+    pub rec_dropped_last_min: u64,
+    pub store: &'a StoreStatus,
+    pub max_ages: MaxAges,
+}
+
+/// Rolls the individual health facts up into the checks that gate trading.
+pub fn safety(inputs: &SafetyInputs<'_>) -> SafetyChecks {
+    safety_at(now_ms(), inputs)
+}
+
+/// Whether a check done at `checked_ms` is too old to trust.
+fn too_old(checked_ms: Option<i64>, now_ms: i64, max_age_ms: i64) -> Option<i64> {
+    let age = now_ms - checked_ms?;
+    (age > max_age_ms).then_some(age)
+}
+
+fn safety_at(now_ms: i64, i: &SafetyInputs<'_>) -> SafetyChecks {
+    let SafetyInputs {
+        feeds,
+        clock,
+        geo,
+        rec,
+        rec_dropped_last_min,
+        store,
+        max_ages,
+    } = *i;
     let mut reasons = Vec::new();
 
     let mut feeds_fresh = true;
@@ -121,12 +185,25 @@ fn safety_at(
         feeds_fresh = false;
         reasons.push(format!("feed stale: {}", f.source.as_str()));
     }
+    for f in feeds
+        .iter()
+        .filter(|f| f.enabled && f.events_dropped_recent > 0)
+    {
+        feeds_fresh = false;
+        reasons.push(format!(
+            "engine dropped {} {} events in the last minute",
+            f.events_dropped_recent,
+            f.source.as_str()
+        ));
+    }
 
-    let clock_ok = clock.ok && clock.offset_ms.is_some();
+    let clock_stale = too_old(clock.checked_ms, now_ms, max_ages.clock_ms);
+    let clock_ok = clock.ok && clock.offset_ms.is_some() && clock_stale.is_none();
     if !clock_ok {
-        match clock.offset_ms {
-            None => reasons.push("clock offset unknown".to_owned()),
-            Some(o) => reasons.push(format!(
+        match (clock_stale, clock.offset_ms) {
+            (Some(age), _) => reasons.push(format!("clock check stale: {} s old", age / 1000)),
+            (None, None) => reasons.push("clock offset unknown".to_owned()),
+            (None, Some(o)) => reasons.push(format!(
                 "clock offset {:.1} ms > {} ms",
                 o.abs(),
                 clock.max_offset_ms
@@ -134,14 +211,18 @@ fn safety_at(
         }
     }
 
-    let geoblock_ok = geo.blocked == Some(false);
-    match geo.blocked {
-        Some(false) => {}
-        Some(true) => reasons.push(format!(
+    let geo_stale = too_old(geo.checked_ms, now_ms, max_ages.geo_ms);
+    let geoblock_ok = geo.blocked == Some(false) && geo_stale.is_none();
+    match (geo.blocked, geo_stale) {
+        (Some(true), _) => reasons.push(format!(
             "geoblocked: {}",
             geo.country.as_deref().unwrap_or("unknown country")
         )),
-        None => reasons.push("geoblock status unknown".to_owned()),
+        (Some(false), Some(age)) => {
+            reasons.push(format!("geoblock check stale: {} s old", age / 1000))
+        }
+        (Some(false), None) => {}
+        (None, _) => reasons.push("geoblock status unknown".to_owned()),
     }
 
     let mut recorder_ok = true;
@@ -163,12 +244,22 @@ fn safety_at(
         Some(_) => {}
     }
 
+    let store_ok = store.ok;
+    if !store_ok {
+        reasons.push(format!(
+            "database writes failing ({} pending): {}",
+            store.pending_writes,
+            store.last_error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+
     SafetyChecks {
         feeds_fresh,
         clock_ok,
         geoblock_ok,
         recorder_ok,
-        all_ok: feeds_fresh && clock_ok && geoblock_ok && recorder_ok,
+        store_ok,
+        all_ok: feeds_fresh && clock_ok && geoblock_ok && recorder_ok && store_ok,
         reasons,
     }
 }
@@ -190,6 +281,8 @@ mod tests {
             reconnects: 0,
             last_error: None,
             stale,
+            events_dropped: 0,
+            events_dropped_recent: 0,
         }
     }
 
@@ -197,7 +290,7 @@ mod tests {
         ClockStatus {
             offset_ms: offset,
             ok,
-            checked_ms: Some(1),
+            checked_ms: Some(NOW - 1_000),
             max_offset_ms: 50.0,
         }
     }
@@ -206,8 +299,40 @@ mod tests {
         GeoStatus {
             blocked,
             country: Some("US".into()),
-            checked_ms: Some(1),
+            checked_ms: Some(NOW - 1_000),
         }
+    }
+
+    fn store_ok() -> StoreStatus {
+        StoreStatus {
+            ok: true,
+            pending_writes: 0,
+            dropped_writes: 0,
+            last_ok_ms: Some(NOW),
+            last_error: None,
+        }
+    }
+
+    /// `safety_at` with a healthy store and the default max ages.
+    fn check(
+        feeds: &[FeedStatusDto],
+        clock: &ClockStatus,
+        geo: &GeoStatus,
+        rec: &RecorderStatus,
+        dropped: u64,
+    ) -> SafetyChecks {
+        safety_at(
+            NOW,
+            &SafetyInputs {
+                feeds,
+                clock,
+                geo,
+                rec,
+                rec_dropped_last_min: dropped,
+                store: &store_ok(),
+                max_ages: MaxAges::default(),
+            },
+        )
     }
 
     fn rec(last_flush_ms: Option<i64>) -> RecorderStatus {
@@ -220,7 +345,7 @@ mod tests {
         }
     }
 
-    const NOW: i64 = 1_000_000;
+    const NOW: i64 = 10_000_000;
 
     #[test]
     fn median_offset() {
@@ -235,8 +360,7 @@ mod tests {
             feed(Source::Binance, true, false),
             feed(Source::Coinbase, false, true),
         ];
-        let s = safety_at(
-            NOW,
+        let s = check(
             &feeds,
             &clock(Some(-3.0), true),
             &geo(Some(false)),
@@ -244,7 +368,7 @@ mod tests {
             0,
         );
         assert!(s.all_ok, "{:?}", s.reasons);
-        assert!(s.feeds_fresh && s.clock_ok && s.geoblock_ok && s.recorder_ok);
+        assert!(s.feeds_fresh && s.clock_ok && s.geoblock_ok && s.recorder_ok && s.store_ok);
         assert!(s.reasons.is_empty());
     }
 
@@ -254,8 +378,7 @@ mod tests {
             feed(Source::Binance, true, false),
             feed(Source::Coinbase, true, true),
         ];
-        let s = safety_at(
-            NOW,
+        let s = check(
             &feeds,
             &clock(Some(63.1), false),
             &geo(None),
@@ -279,8 +402,7 @@ mod tests {
 
     #[test]
     fn safety_unknown_clock_and_blocked_geo() {
-        let s = safety_at(
-            NOW,
+        let s = check(
             &[],
             &clock(None, false),
             &geo(Some(true)),
@@ -295,8 +417,7 @@ mod tests {
     #[test]
     fn safety_recorder_checks() {
         let ok = |dropped, flush| {
-            safety_at(
-                NOW,
+            check(
                 &[],
                 &clock(Some(0.0), true),
                 &geo(Some(false)),
@@ -309,6 +430,80 @@ mod tests {
         assert!(!ok(1, Some(NOW)));
         assert!(!ok(0, Some(NOW - 5_001)));
         assert!(!ok(0, None));
+    }
+
+    #[test]
+    fn stale_clock_and_geoblock_results_are_not_trusted() {
+        let ages = MaxAges {
+            clock_ms: 120_000,
+            geo_ms: 600_000,
+        };
+        let run = |clock_age: i64, geo_age: i64| {
+            let mut c = clock(Some(1.0), true);
+            c.checked_ms = Some(NOW - clock_age);
+            let mut g = geo(Some(false));
+            g.checked_ms = Some(NOW - geo_age);
+            safety_at(
+                NOW,
+                &SafetyInputs {
+                    feeds: &[],
+                    clock: &c,
+                    geo: &g,
+                    rec: &rec(Some(NOW)),
+                    rec_dropped_last_min: 0,
+                    store: &store_ok(),
+                    max_ages: ages,
+                },
+            )
+        };
+        let fresh = run(120_000, 600_000);
+        assert!(fresh.clock_ok && fresh.geoblock_ok, "{:?}", fresh.reasons);
+        // A pre-sleep "ok" an hour old passes nothing.
+        let s = run(3_600_000, 3_600_000);
+        assert!(!s.clock_ok && !s.geoblock_ok && !s.all_ok);
+        assert!(
+            s.reasons
+                .contains(&"clock check stale: 3600 s old".to_owned())
+        );
+        assert!(
+            s.reasons
+                .contains(&"geoblock check stale: 3600 s old".to_owned())
+        );
+    }
+
+    #[test]
+    fn dropped_events_and_failing_store_fail_the_checks() {
+        let mut f = feed(Source::ClobMarket, true, false);
+        f.events_dropped_recent = 7;
+        let failing = StoreStatus {
+            ok: false,
+            pending_writes: 3,
+            dropped_writes: 0,
+            last_ok_ms: None,
+            last_error: Some("connection refused".into()),
+        };
+        let s = safety_at(
+            NOW,
+            &SafetyInputs {
+                feeds: &[f],
+                clock: &clock(Some(0.0), true),
+                geo: &geo(Some(false)),
+                rec: &rec(Some(NOW)),
+                rec_dropped_last_min: 0,
+                store: &failing,
+                max_ages: MaxAges::default(),
+            },
+        );
+        assert!(!s.feeds_fresh && !s.store_ok && !s.all_ok);
+        assert!(s.clock_ok && s.geoblock_ok && s.recorder_ok);
+        assert!(
+            s.reasons
+                .contains(&"engine dropped 7 clob_market events in the last minute".to_owned())
+        );
+        assert!(
+            s.reasons
+                .contains(&"database writes failing (3 pending): connection refused".to_owned())
+        );
     }
 
     #[test]

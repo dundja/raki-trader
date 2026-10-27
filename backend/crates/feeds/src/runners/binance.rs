@@ -12,7 +12,8 @@ use crate::parse::binance::parse_binance;
 pub struct BinanceTiming {
     /// Binance cuts connections after 24 h; reconnect before that.
     pub max_lifetime: Duration,
-    /// Reconnect when nothing arrives for this long (the server pings every 20 s).
+    /// Reconnect when no market data arrives for this long. The server's protocol pings (every
+    /// 20 s) do not count.
     pub idle_timeout: Duration,
 }
 
@@ -20,7 +21,7 @@ impl Default for BinanceTiming {
     fn default() -> Self {
         BinanceTiming {
             max_lifetime: Duration::from_secs(23 * 3600),
-            idle_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(30),
         }
     }
 }

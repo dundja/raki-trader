@@ -11,7 +11,8 @@ use crate::parse::coinbase::parse_coinbase;
 
 #[derive(Clone, Debug)]
 pub struct CoinbaseTiming {
-    /// Reconnect when nothing arrives for this long; `heartbeat` comes every second per product.
+    /// Reconnect when no ticker arrives for this long. `heartbeat` frames (every second per
+    /// product) do not count: they keep coming while the ticker channel is dead.
     pub idle_timeout: Duration,
 }
 

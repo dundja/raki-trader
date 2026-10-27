@@ -13,7 +13,7 @@ use crate::parse::rtds::parse_rtds;
 pub struct RtdsTiming {
     /// Text `ping` interval. The server does not answer it.
     pub ping: Duration,
-    /// Reconnect when nothing arrives for this long.
+    /// Reconnect when no price for a tracked asset arrives for this long.
     pub stale_after: Duration,
 }
 
@@ -21,7 +21,7 @@ impl Default for RtdsTiming {
     fn default() -> Self {
         RtdsTiming {
             ping: Duration::from_secs(5),
-            stale_after: Duration::from_secs(15),
+            stale_after: Duration::from_secs(10),
         }
     }
 }
