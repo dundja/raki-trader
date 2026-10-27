@@ -78,3 +78,11 @@ export function fmtMb(bytes: number | null | undefined): string {
     maximumFractionDigits: 1,
   })} MB`
 }
+
+/** Epoch ms in the browser's local time ("2026-10-27 14:05:00"). Pair with fmtUtc in a title. */
+export function fmtLocal(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return DASH
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}

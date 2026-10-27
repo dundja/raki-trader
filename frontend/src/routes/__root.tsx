@@ -68,7 +68,6 @@ function RootLayout() {
 /** After this long in "reconnecting" with nothing to show, say the backend is unreachable. */
 const UNREACHABLE_AFTER_MS = 3000
 
-// Pages land in a later task; these paths are not in the generated route tree yet.
 const NAV: ReadonlyArray<{ to: string; label: string }> = [
   { to: '/', label: 'Live' },
   { to: '/health', label: 'Health' },

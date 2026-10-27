@@ -11,6 +11,8 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as HealthRouteImport } from './routes/health'
+import { Route as WindowsIndexRouteImport } from './routes/windows.index'
+import { Route as WindowsSlugRouteImport } from './routes/windows.$slug'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +24,49 @@ const HealthRoute = HealthRouteImport.update({
   path: '/health',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WindowsIndexRoute = WindowsIndexRouteImport.update({
+  id: '/windows/',
+  path: '/windows/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const WindowsSlugRoute = WindowsSlugRouteImport.update({
+  id: '/windows/$slug',
+  path: '/windows/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/windows/$slug': typeof WindowsSlugRoute
+  '/windows/': typeof WindowsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/windows/$slug': typeof WindowsSlugRoute
+  '/windows': typeof WindowsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/windows/$slug': typeof WindowsSlugRoute
+  '/windows/': typeof WindowsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/health'
+  fullPaths: '/' | '/health' | '/windows/$slug' | '/windows/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/health'
-  id: '__root__' | '/' | '/health'
+  to: '/' | '/health' | '/windows/$slug' | '/windows'
+  id: '__root__' | '/' | '/health' | '/windows/$slug' | '/windows/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   HealthRoute: typeof HealthRoute
+  WindowsSlugRoute: typeof WindowsSlugRoute
+  WindowsIndexRoute: typeof WindowsIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +85,28 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof HealthRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/windows/': {
+      id: '/windows/'
+      path: '/windows'
+      fullPath: '/windows/'
+      preLoaderRoute: typeof WindowsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/windows/$slug': {
+      id: '/windows/$slug'
+      path: '/windows/$slug'
+      fullPath: '/windows/$slug'
+      preLoaderRoute: typeof WindowsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   HealthRoute: HealthRoute,
+  WindowsSlugRoute: WindowsSlugRoute,
+  WindowsIndexRoute: WindowsIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
