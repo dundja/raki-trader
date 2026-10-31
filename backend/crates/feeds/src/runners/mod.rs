@@ -391,6 +391,11 @@ impl Link<'_> {
         }
     }
 
+    /// Sends an event that is not parsed data (it does not count as data for the idle check).
+    pub(crate) fn emit(&mut self, ev: FeedEvent) {
+        self.rt.emit(ev);
+    }
+
     pub(crate) fn parse_error(&mut self, e: &ParseError) {
         self.rt.parse_errors += 1;
         if let Some(since_last) = self.rt.parse_warn.hit() {

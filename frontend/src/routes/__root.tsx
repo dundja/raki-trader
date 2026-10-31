@@ -73,6 +73,7 @@ const NAV: ReadonlyArray<{ to: string; label: string }> = [
   { to: '/', label: 'Live' },
   { to: '/health', label: 'Health' },
   { to: '/windows', label: 'Windows' },
+  { to: '/shadow', label: 'Shadow' },
 ]
 
 const STATUS_LABEL: Record<LiveStatus, string> = {

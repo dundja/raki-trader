@@ -52,6 +52,19 @@ impl OracleState {
         Some((p.value, p.source))
     }
 
+    /// Every point as `(unix s, value)`, ascending, the last point of a second winning.
+    pub fn seconds(&self, asset: Asset, kind: OracleKind) -> Vec<(i64, f64)> {
+        let mut out: Vec<(i64, f64)> = Vec::new();
+        for (ts, p) in self.series.get(&(asset, slot(kind))).into_iter().flatten() {
+            let s = ts.div_euclid(1000);
+            match out.last_mut() {
+                Some(last) if last.0 == s => last.1 = p.value,
+                _ => out.push((s, p.value)),
+            }
+        }
+        out
+    }
+
     /// Drops points older than `now_ms - RETENTION_MS`.
     pub fn prune(&mut self, now_ms: i64) {
         let cutoff = now_ms - RETENTION_MS;
@@ -98,6 +111,16 @@ mod tests {
         o.insert(BTC, TWAP, Source::RtdsLegacy, 2000, 9.0);
         o.insert(BTC, TWAP, Source::Polybolt, 2000, 2.0);
         assert_eq!(o.value_at(BTC, TWAP, 2000), Some((2.0, Source::Polybolt)));
+    }
+
+    #[test]
+    fn seconds_are_ascending_and_one_per_second() {
+        let mut o = OracleState::default();
+        o.insert(BTC, TWAP, Source::Polybolt, 2_000, 2.0);
+        o.insert(BTC, TWAP, Source::Polybolt, 1_000, 1.0);
+        o.insert(BTC, TWAP, Source::Polybolt, 1_500, 1.5);
+        assert_eq!(o.seconds(BTC, TWAP), vec![(1, 1.5), (2, 2.0)]);
+        assert!(o.seconds(Asset::Eth, TWAP).is_empty());
     }
 
     #[test]

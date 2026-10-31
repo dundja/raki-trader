@@ -63,7 +63,9 @@ pub struct GammaWindow {
     pub closed: bool,
     pub twap_lookback_s: Option<i64>,
     pub fee_rate: Option<f64>,
+    pub fee_exponent: Option<f64>,
     pub tick_size: Option<f64>,
+    pub order_min_size: Option<f64>,
 }
 
 /// A parsed message from any feed or REST poll, as consumed by the engine.
@@ -128,6 +130,13 @@ pub enum FeedEvent {
     FeedReset {
         source: Source,
         shard: Option<Asset>,
+    },
+    /// Messages lost inside one connection (a sequence number skipped), without a reconnect.
+    SeqGap {
+        source: Source,
+        channel: String,
+        expected: u64,
+        got: u64,
     },
     /// `window: None` means Gamma answered 404.
     GammaFetched {

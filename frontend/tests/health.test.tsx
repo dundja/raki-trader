@@ -152,6 +152,8 @@ describe('GateProgress', () => {
     gate_twap_mismatch: 1,
     gate_twap_awaiting: 2,
     gate_twap_unverified: 0,
+    twap_missed_end: 2,
+    gate_twap_missed_end: 1,
     gate_target_windows: 500,
   }
 
@@ -162,12 +164,13 @@ describe('GateProgress', () => {
     ).toBeInTheDocument()
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '42')
     expect(screen.getByTestId('twap-tally')).toHaveTextContent(
-      'Gate TWAP vs Gamma: 39 match · 1 mismatch · 2 awaiting · 0 unverified',
+      'Gate TWAP vs Gamma: 39 match · 1 mismatch · 2 awaiting · 0 unverified · ' +
+        '1 recorded through the end with no final TWAP point',
     )
     // All-asset, any-source numbers are shown apart and labelled as not the gate.
     expect(screen.getByTestId('all-tally')).toHaveTextContent('not the gate')
     expect(screen.getByTestId('all-tally')).toHaveTextContent(
-      '181 windows with TWAP · 167 match · 0 mismatch · 6 awaiting · 8 unverified',
+      '181 windows with TWAP · 167 match · 0 mismatch · 6 awaiting · 8 unverified · 2 no final point',
     )
     expect(screen.getByTestId('recorded')).toHaveTextContent('12.6 h awake')
     expect(screen.getByTestId('recorded')).toHaveTextContent('3 sessions')

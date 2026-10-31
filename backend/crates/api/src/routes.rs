@@ -9,8 +9,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use raki_core::{
-    Asset, ControlRequest, ControlResponse, HealthSnapshot, LiveSnapshot, RecordingStats,
-    SeriesRow, WindowRecord,
+    Asset, Calibration, ControlRequest, ControlResponse, HealthSnapshot, LiveSnapshot,
+    PREDICTION_CHECKPOINTS, PredictionRow, RecordingStats, SeriesRow, ShadowFillRow,
+    ShadowSummary, WindowRecord, WindowShadow,
 };
 use serde::Deserialize;
 use tokio::sync::oneshot;
@@ -105,6 +106,69 @@ pub async fn get_series(
     Path(slug): Path<String>,
 ) -> ApiResult<Vec<SeriesRow>> {
     Ok(Json(s.store.get_series(&slug).await?))
+}
+
+pub async fn window_predictions(
+    State(s): State<AppState>,
+    Path(slug): Path<String>,
+) -> ApiResult<Vec<PredictionRow>> {
+    Ok(Json(s.store.window_predictions(&slug).await?))
+}
+
+pub async fn window_shadow(
+    State(s): State<AppState>,
+    Path(slug): Path<String>,
+) -> ApiResult<WindowShadow> {
+    Ok(Json(WindowShadow {
+        evals: s.store.window_shadow_evals(&slug).await?,
+        fills: s.store.shadow_fills(Some(&slug), MAX_LIMIT).await?,
+    }))
+}
+
+pub async fn shadow_summary(State(s): State<AppState>) -> ApiResult<ShadowSummary> {
+    Ok(Json(s.store.shadow_summary().await?))
+}
+
+#[derive(Deserialize)]
+pub struct CalibrationQuery {
+    checkpoint: Option<i64>,
+    asset: Option<String>,
+}
+
+pub async fn calibration(
+    State(s): State<AppState>,
+    q: Result<Query<CalibrationQuery>, QueryRejection>,
+) -> ApiResult<Calibration> {
+    let Query(q) = q.map_err(|e| ApiError::BadRequest(e.body_text()))?;
+    let checkpoint = q.checkpoint.unwrap_or(30);
+    if !PREDICTION_CHECKPOINTS.contains(&checkpoint) {
+        return Err(ApiError::BadRequest(format!(
+            "checkpoint must be one of {PREDICTION_CHECKPOINTS:?}"
+        )));
+    }
+    let asset = parse_asset(q.asset.as_deref())?;
+    Ok(Json(s.store.calibration(checkpoint, asset).await?))
+}
+
+#[derive(Deserialize)]
+pub struct FillsQuery {
+    limit: Option<i64>,
+}
+
+pub async fn shadow_fills(
+    State(s): State<AppState>,
+    q: Result<Query<FillsQuery>, QueryRejection>,
+) -> ApiResult<Vec<ShadowFillRow>> {
+    let Query(q) = q.map_err(|e| ApiError::BadRequest(e.body_text()))?;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    Ok(Json(s.store.shadow_fills(None, limit).await?))
+}
+
+fn parse_asset(a: Option<&str>) -> Result<Option<Asset>, ApiError> {
+    a.map(|a| {
+        Asset::from_any(a).ok_or_else(|| ApiError::BadRequest(format!("unknown asset: {a}")))
+    })
+    .transpose()
 }
 
 pub async fn pause(

@@ -6,4 +6,5 @@ pub mod control;
 pub mod engine;
 pub mod oracle;
 pub mod series;
+pub mod shadow;
 pub mod windows;

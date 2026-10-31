@@ -18,6 +18,7 @@ use clap::Parser;
 use raki_api::AppState;
 use raki_core::{Source, now_ms, now_ns};
 use raki_engine::engine::{Engine, EngineConfig};
+use raki_engine::shadow::ShadowConfig;
 use raki_feeds::rest::{PolyRest, RestUrls};
 use raki_feeds::runners::{
     FeedCtx, PolyCreds, run_binance, run_clob, run_coinbase, run_polybolt, run_rtds_legacy,
@@ -235,6 +236,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         EngineConfig {
             assets,
             session_id: session.id.to_string(),
+            shadow: Some(ShadowConfig::default()),
         },
         now_ms(),
     );
@@ -249,6 +251,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             windows = adopted,
             "adopted unfinished windows from earlier sessions"
         );
+    }
+    if let Some(shadow) = engine.shadow_config() {
+        let hash = engine.params_hash().to_owned();
+        store
+            .upsert_strategy_params(&hash, raki_strategy::v0::STRATEGY_ID, &shadow.params_json(), now_ms())
+            .await?;
+        tracing::info!(params_hash = %hash, "shadow predictions and strategy v0 shadow on (no orders)");
     }
     let (writer, writer_task) = writer::spawn_writer(store.clone(), session.id);
     let health_inputs = HealthInputs {

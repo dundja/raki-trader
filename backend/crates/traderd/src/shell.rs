@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::health::sleep::SleepNotice;
 use crate::health::{self, HealthState, SafetyInputs};
-use crate::writer::{Audit, Write, WriterStats, WriterTx};
+use crate::writer::{Audit, ShadowWrite, Write, WriterStats, WriterTx};
 
 const TICK: Duration = Duration::from_secs(1);
 /// The recorder safety check looks at drops over this trailing window.
@@ -176,12 +176,13 @@ impl DropWindow {
 /// - Engine outputs are carried out here: windows, series rows (batched per tick), gaps and audits
 ///   go to the store writer, which never blocks this loop and retries failed writes; REST
 ///   requests run as spawned tasks whose results come back as events; each asset's desired CLOB
-///   tokens go to that asset's CLOB runner; a book resync is logged and stored as a gap.
+///   tokens go to that asset's CLOB runner; a book resync is only counted (health), not a gap.
 /// - Every tick computes the safety checks, feeds them to the control state machine and publishes
 ///   a [`LiveSnapshot`]; every 10 s it writes the session heartbeat.
 /// - Control messages are applied, audited and answered.
 /// - A `FeedReset` after a connection's first one (per source and shard) is a reconnect: it is
-///   stored as a feed gap. A machine sleep is stored as a gap with its duration.
+///   stored as a feed gap, as is a sequence gap inside a connection. A machine sleep is stored
+///   as a gap with its duration.
 /// - On shutdown every tracked window is written once more (with its latest coverage), and the
 ///   writer gets a short time to store what is pending.
 pub async fn run_engine_loop(
@@ -264,14 +265,24 @@ impl Shell {
             };
             self.gap(source, now, reason);
         }
+        if let FeedEvent::SeqGap {
+            source,
+            channel,
+            expected,
+            got,
+        } = &ev
+        {
+            let reason = format!("seq gap {channel}: expected {expected}, got {got}");
+            self.gap(*source, now, reason);
+        }
         let outs = self.engine.handle(ev, now);
-        self.execute(outs, now);
+        self.execute(outs);
     }
 
     fn on_tick(&mut self) {
         let now = now_ms();
         let outs = self.engine.tick(now);
-        self.execute(outs, now);
+        self.execute(outs);
         self.flush_series();
         if self
             .last_heartbeat_ms
@@ -374,7 +385,7 @@ impl Shell {
         let _ = msg.reply.send(resp);
     }
 
-    fn execute(&mut self, outs: Vec<EngineOutput>, now: i64) {
+    fn execute(&mut self, outs: Vec<EngineOutput>) {
         for out in outs {
             match out {
                 EngineOutput::Series(rows) => self.series.extend(rows),
@@ -385,10 +396,27 @@ impl Shell {
                     }
                 }
                 EngineOutput::DesiredTokens(tokens) => self.send_desired(tokens),
+                // Not a recording gap: the raw stream is complete and the snapshot fixed our
+                // book. Counted in the health snapshot instead of the gap log.
                 EngineOutput::BookResync { asset_id } => {
-                    tracing::warn!(%asset_id, "book snapshot disagreed with our book; resynced");
-                    let reason = format!("book resync {asset_id}");
-                    self.gap(Source::ClobMarket, now, reason);
+                    tracing::debug!(%asset_id, "book snapshot disagreed with our book; resynced");
+                }
+                EngineOutput::Prediction(p) => {
+                    self.writer.send(Write::Shadow(ShadowWrite::Prediction(p)));
+                }
+                EngineOutput::ShadowEval(e) => {
+                    self.writer.send(Write::Shadow(ShadowWrite::Eval(e)));
+                }
+                EngineOutput::ShadowFill(f) => {
+                    tracing::info!(
+                        slug = %f.slug,
+                        side = ?f.side,
+                        status = ?f.status,
+                        shares = %f.shares.round_dp(4),
+                        cost = %f.cost.round_dp(4),
+                        "shadow v0 simulated fill (no order placed)"
+                    );
+                    self.writer.send(Write::Shadow(ShadowWrite::Fill(f)));
                 }
             }
         }
@@ -599,6 +627,7 @@ mod tests {
             EngineConfig {
                 assets: vec![Asset::Btc],
                 session_id: session.id.to_string(),
+                shadow: None,
             },
             now_ms(),
         );
@@ -705,6 +734,26 @@ mod tests {
             1,
             "the eth shard's first connect is not a gap"
         );
+
+        events_tx
+            .send(FeedEvent::SeqGap {
+                source: Source::Polybolt,
+                channel: "price.crypto.twap".into(),
+                expected: 2,
+                got: 5,
+            })
+            .await
+            .unwrap();
+        eventually(|| async {
+            let n = count(
+                &store,
+                "select count(*) from feed_gaps where source = 'polybolt' \
+                 and reason = 'seq gap price.crypto.twap: expected 2, got 5'",
+            )
+            .await;
+            (n == 1).then_some(())
+        })
+        .await;
 
         // A machine sleep becomes a gap with its duration and leaves recorded time.
         sleep_tx

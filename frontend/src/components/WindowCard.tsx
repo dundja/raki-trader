@@ -5,7 +5,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { getJson, qk } from '../api/client'
 import type { LiveWindow } from '../api/generated/LiveWindow'
 import type { SeriesRow } from '../api/generated/SeriesRow'
-import { fmtAgo, fmtCountdown, fmtPrice, fmtProb, fmtSigned, fmtUtc } from './fmt'
+import { fmtAgo, fmtCountdown, fmtPct, fmtPrice, fmtProb, fmtSigned, fmtUtc } from './fmt'
+import { shadowText } from './shadow'
 import { useNow } from './useNow'
 
 const COUNTDOWN_TICK_MS = 250
@@ -152,6 +153,23 @@ export function WindowCard({ window: w }: { window: LiveWindow }) {
         <Field label="Coinbase">{fmtPrice(w.coinbase_mid)}</Field>
         <Field label="Up bid / ask">{bookSide(w.up_bid, w.up_ask)}</Field>
         <Field label="Down bid / ask">{bookSide(w.down_bid, w.down_ask)}</Field>
+        <Field label="Model P(Up)">
+          <span
+            data-testid="model-p-up"
+            title={
+              w.prediction === null
+                ? undefined
+                : `final TWAP forecast ${fmtPrice(w.prediction.mu)} ± ${fmtPrice(w.prediction.sd)}`
+            }
+          >
+            {fmtPct(w.prediction?.p_up)}
+          </span>
+        </Field>
+        {w.shadow !== null && (
+          <Field label="v0 shadow">
+            <span data-testid="v0-shadow">{shadowText(w.shadow)}</span>
+          </Field>
+        )}
         <Field label="TWAP age">
           <span title={w.twap_ts_ms === null ? undefined : fmtUtc(w.twap_ts_ms)}>
             {fmtAgo(w.twap_ts_ms, now)}

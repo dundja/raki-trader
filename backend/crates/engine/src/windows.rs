@@ -4,6 +4,7 @@ use raki_core::{GammaWindow, OracleKind, Outcome, WindowId, WindowRecord, Window
 
 use crate::engine::Request;
 use crate::oracle::OracleState;
+use crate::shadow::WindowShadow;
 
 /// Minimum gap between Gamma discovery requests for a window without a `condition_id`.
 pub const DISCOVERY_INTERVAL_MS: i64 = 5_000;
@@ -39,6 +40,9 @@ pub struct WindowState {
     finished_ms: Option<i64>,
     /// When tracking last resumed after a pause (adopted at startup, or a wake from sleep).
     resumed_ms: Option<i64>,
+    /// The latest Gamma event: market config (fees, tick, min size, TWAP lookback).
+    pub gamma: Option<GammaWindow>,
+    pub shadow: WindowShadow,
 }
 
 impl WindowState {
@@ -77,6 +81,8 @@ impl WindowState {
             last_resolution_req_ms: None,
             finished_ms: None,
             resumed_ms: None,
+            gamma: None,
+            shadow: WindowShadow::default(),
         }
     }
 
@@ -92,6 +98,8 @@ impl WindowState {
             last_resolution_req_ms: None,
             finished_ms: None,
             resumed_ms: Some(now_ms),
+            gamma: None,
+            shadow: WindowShadow::default(),
         }
     }
 
@@ -116,6 +124,7 @@ impl WindowState {
         rec.down_token = Some(w.down_token.clone());
         rec.price_to_beat_gamma = w.price_to_beat.or(rec.price_to_beat_gamma);
         rec.final_price_gamma = w.final_price.or(rec.final_price_gamma);
+        self.gamma = Some(w.clone());
     }
 
     /// Latches the winner: the first winner sticks. `resolved_at` and `resolution_seen_ms`

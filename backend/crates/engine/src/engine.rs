@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use raki_core::{
-    Asset, FeedEvent, LiveWindow, Outcome, SeriesRow, Source, WindowId, WindowRecord, WindowStatus,
+    Asset, FeedEvent, LiveWindow, Outcome, PredictionRow, SeriesRow, ShadowEvalRow, ShadowFillRow,
+    Source, TradingMode, WindowId, WindowRecord, WindowStatus,
 };
 
 use crate::book::BookState;
@@ -11,6 +12,7 @@ use crate::cex::CexState;
 use crate::control::Control;
 use crate::oracle::OracleState;
 use crate::series::WindowPrices;
+use crate::shadow::{self, ShadowConfig};
 use crate::windows::WindowState;
 
 /// A gap this long between two calls means tracking paused (the machine slept, or the loop was
@@ -42,12 +44,19 @@ pub enum EngineOutput {
     BookResync {
         asset_id: String,
     },
+    /// Shadow (no orders, never a gate): a model forecast at a checkpoint, a strategy v0
+    /// evaluation, and the simulated fill of an `enter`.
+    Prediction(PredictionRow),
+    ShadowEval(ShadowEvalRow),
+    ShadowFill(ShadowFillRow),
 }
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub assets: Vec<Asset>,
     pub session_id: String,
+    /// `None` turns predictions and the v0 shadow off.
+    pub shadow: Option<ShadowConfig>,
 }
 
 #[derive(Debug)]
@@ -62,12 +71,22 @@ pub struct Engine {
     desired: DesiredTokens,
     /// The latest `now_ms` seen by `handle` or `tick`, to notice a pause.
     last_seen_ms: Option<i64>,
+    params_hash: String,
+    /// Next shadow evaluation number (unique per session).
+    eval_seq: u64,
 }
 
 impl Engine {
     pub fn new(cfg: EngineConfig, now_ms: i64) -> Engine {
+        let params_hash = cfg
+            .shadow
+            .as_ref()
+            .map(ShadowConfig::params_hash)
+            .unwrap_or_default();
         Engine {
             cfg,
+            params_hash,
+            eval_seq: 0,
             books: HashMap::new(),
             oracle: OracleState::default(),
             cex: CexState::default(),
@@ -120,6 +139,11 @@ impl Engine {
     pub fn handle(&mut self, ev: FeedEvent, now_ms: i64) -> Vec<EngineOutput> {
         self.observe(now_ms);
         let mut out = vec![];
+        // A simulated fill sees the book as it was at its due time: before the first book
+        // event at or after it.
+        if matches!(ev, FeedEvent::Book { .. } | FeedEvent::PriceChange { .. }) {
+            self.fill_due(now_ms, &mut out);
+        }
         match ev {
             FeedEvent::Book {
                 asset_id,
@@ -239,6 +263,7 @@ impl Engine {
             | FeedEvent::LastTrade { .. }
             | FeedEvent::TickSize { .. }
             | FeedEvent::FeedReset { .. }
+            | FeedEvent::SeqGap { .. }
             | FeedEvent::GammaFetched { window: None, .. }
             | FeedEvent::GammaFailed { .. }
             | FeedEvent::Resolution { winner: None, .. } => {}
@@ -274,6 +299,7 @@ impl Engine {
         if !rows.is_empty() {
             out.push(EngineOutput::Series(rows));
         }
+        self.shadow_tick(now_ms, &mut out);
 
         let requests: Vec<Request> = self
             .windows
@@ -321,9 +347,57 @@ impl Engine {
                     up_ask: p.up_ask,
                     down_bid: p.down_bid,
                     down_ask: p.down_ask,
+                    prediction: self
+                        .windows
+                        .get(&id)
+                        .and_then(|w| w.shadow.live_prediction()),
+                    shadow: self
+                        .cfg
+                        .shadow
+                        .as_ref()
+                        .filter(|s| s.v0_assets.contains(&asset))
+                        .map(|_| {
+                            self.windows
+                                .get(&id)
+                                .map(|w| w.shadow.live_shadow())
+                                .unwrap_or_default()
+                        }),
                 }
             })
             .collect()
+    }
+
+    /// The shadow parameter set's hash (empty with the shadow off).
+    pub fn params_hash(&self) -> &str {
+        &self.params_hash
+    }
+
+    pub fn shadow_config(&self) -> Option<&ShadowConfig> {
+        self.cfg.shadow.as_ref()
+    }
+
+    fn shadow_tick(&mut self, now_ms: i64, out: &mut Vec<EngineOutput>) {
+        let Some(cfg) = &self.cfg.shadow else {
+            return;
+        };
+        let ctx = shadow::Ctx {
+            cfg,
+            params_hash: &self.params_hash,
+            session_id: &self.cfg.session_id,
+            oracle: &self.oracle,
+            cex: &self.cex,
+            books: &self.books,
+            running: self.control.state().mode == TradingMode::Running,
+        };
+        for w in self.windows.values_mut() {
+            shadow::on_tick(&ctx, w, now_ms, &mut self.eval_seq, out);
+        }
+    }
+
+    fn fill_due(&mut self, now_ms: i64, out: &mut Vec<EngineOutput>) {
+        for w in self.windows.values_mut() {
+            shadow::fill_due(&self.cfg.session_id, &self.books, w, now_ms, out);
+        }
     }
 
     pub fn control(&mut self) -> &mut Control {
@@ -409,6 +483,7 @@ mod tests {
             EngineConfig {
                 assets: vec![Asset::Btc],
                 session_id: "session-1".into(),
+                shadow: None,
             },
             START_MS,
         )
@@ -449,8 +524,10 @@ mod tests {
                 final_price,
                 closed: final_price.is_some(),
                 twap_lookback_s: Some(60),
-                fee_rate: None,
-                tick_size: None,
+                fee_rate: Some(0.07),
+                fee_exponent: Some(1.0),
+                tick_size: Some(0.01),
+                order_min_size: Some(5.0),
             }),
             recv_ms: 0,
         }
@@ -969,6 +1046,7 @@ mod tests {
             EngineConfig {
                 assets: vec![Asset::Btc, Asset::Eth],
                 session_id: "session-1".into(),
+                shadow: None,
             },
             START_MS,
         );
@@ -984,6 +1062,7 @@ mod tests {
             EngineConfig {
                 assets: vec![Asset::Btc, Asset::Eth],
                 session_id: "session-1".into(),
+                shadow: None,
             },
             START_MS,
         );
@@ -1119,4 +1198,123 @@ mod tests {
             Some(raki_core::StopKind::Startup)
         );
     }
+
+    #[test]
+    fn shadow_predicts_at_checkpoints_and_fills_v0_against_the_later_book() {
+        use raki_core::{SafetyChecks, ShadowAction, ShadowFillStatus};
+        use raki_strategy::model::ModelParams;
+
+        use crate::shadow::{CHECKPOINTS, ShadowConfig};
+
+        let t0 = (START - 120) * 1000;
+        let mut e = Engine::new(
+            EngineConfig {
+                assets: vec![Asset::Btc],
+                session_id: "session-1".into(),
+                shadow: Some(ShadowConfig {
+                    model: ModelParams {
+                        vol_min_points: 10,
+                        ..ModelParams::default()
+                    },
+                    ..ShadowConfig::default()
+                }),
+            },
+            t0,
+        );
+        let ok = SafetyChecks {
+            feeds_fresh: true,
+            clock_ok: true,
+            geoblock_ok: true,
+            recorder_ok: true,
+            store_ok: true,
+            all_ok: true,
+            reasons: vec![],
+        };
+        e.control().on_safety(&ok, t0);
+        // Spot at 100 ± 0.05 (σ = 0.1 per second) against a price to beat of 99.0: Up firms up
+        // as the window runs out.
+        let spot = |s: i64| FeedEvent::Oracle {
+            asset: Asset::Btc,
+            kind: OracleKind::Chainlink,
+            source: Source::Polybolt,
+            ts_ms: s * 1000,
+            value: 100.0 + if s % 2 == 0 { 0.05 } else { -0.05 },
+        };
+        let mut outs = vec![];
+        for s in START - 120..NEXT {
+            let now = s * 1000 + 100;
+            outs.extend(e.handle(spot(s), now));
+            if s == START - 119 {
+                outs.extend(e.handle(gamma(START, None), now));
+            }
+            if s == START {
+                outs.extend(e.handle(twap(START_MS, 99.0), now));
+                outs.extend(e.handle(book(&up(START), "0.95", "0.96"), now));
+                outs.extend(e.handle(book(&down(START), "0.03", "0.05"), now));
+            }
+            outs.extend(e.tick(now));
+            if NEXT - s == 45 {
+                // The decision (limit 0.96) was just taken; before it is due (250 ms) the ask
+                // moves to 0.97, so the fill at the next event finds nothing at the limit.
+                outs.extend(e.handle(book(&up(START), "0.95", "0.97"), now + 200));
+                outs.extend(e.handle(book(&up(START), "0.95", "0.97"), now + 300));
+            }
+        }
+
+        let preds: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                EngineOutput::Prediction(p) if p.slug == slug(START) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let checkpoints: Vec<i64> = preds.iter().map(|p| p.checkpoint_s).collect();
+        assert_eq!(checkpoints, CHECKPOINTS);
+        assert!(preds.iter().all(|p| p.ptb == 99.0), "our price to beat wins over Gamma's");
+        assert!(
+            preds.windows(2).all(|w| w[1].sd < w[0].sd),
+            "the forecast narrows as the window runs out"
+        );
+        assert!(preds[0].p_up < 0.9 && preds.iter().skip(5).all(|p| p.p_up > 0.99));
+
+        let evals: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                EngineOutput::ShadowEval(ev) if ev.slug == slug(START) => Some(ev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evals.len(), 2, "{evals:?}");
+        // The previous window (no price to beat) used the first 16 numbers, skipping.
+        assert_eq!((evals[0].seq, evals[0].secs_left), (16, 45));
+        assert_eq!(evals[0].action, ShadowAction::Enter);
+        assert_eq!(evals[0].best_ask, Some(d("0.96")));
+        assert_eq!((evals[1].seq, evals[1].secs_left), (17, 44));
+        assert_eq!(evals[1].best_ask, Some(d("0.97")));
+
+        let fills: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                EngineOutput::ShadowFill(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].status, ShadowFillStatus::NoFill);
+        assert_eq!(fills[0].filled_ms, (NEXT - 45) * 1000 + 400);
+        assert_eq!(fills[1].status, ShadowFillStatus::Filled);
+        assert_eq!((fills[1].seq, fills[1].limit_price), (17, d("0.97")));
+        assert_eq!(fills[1].cost, d("5"));
+        assert_eq!(fills[1].side, Outcome::Up);
+
+        let live = e.live_windows(END_MS - 900);
+        let shadow = live[0].shadow.as_ref().unwrap();
+        assert_eq!(
+            shadow.fill.as_ref().map(|f| f.status),
+            Some(ShadowFillStatus::Filled)
+        );
+        assert!(!shadow.pending);
+        assert!(live[0].prediction.as_ref().unwrap().p_up > 0.99);
+    }
+
 }

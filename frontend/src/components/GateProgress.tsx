@@ -35,12 +35,16 @@ export function GateProgress({ stats }: { stats: RecordingStats | null }) {
       <p data-testid="twap-tally">
         Gate TWAP vs Gamma: {fmtInt(stats.gate_twap_match)} match ·{' '}
         {fmtInt(stats.gate_twap_mismatch)} mismatch · {fmtInt(stats.gate_twap_awaiting)} awaiting ·{' '}
-        {fmtInt(stats.gate_twap_unverified)} unverified
+        {fmtInt(stats.gate_twap_unverified)} unverified ·{' '}
+        <span className={stats.gate_twap_missed_end > 0 ? 'bad' : undefined}>
+          {fmtInt(stats.gate_twap_missed_end)} recorded through the end with no final TWAP point
+        </span>
       </p>
       <p className="muted" data-testid="all-tally">
         All assets and sources (not the gate): {fmtInt(stats.windows_with_twap)} windows with TWAP ·{' '}
         {fmtInt(stats.twap_match)} match · {fmtInt(stats.twap_mismatch)} mismatch ·{' '}
-        {fmtInt(stats.twap_awaiting)} awaiting · {fmtInt(stats.twap_unverified)} unverified
+        {fmtInt(stats.twap_awaiting)} awaiting · {fmtInt(stats.twap_unverified)} unverified ·{' '}
+        {fmtInt(stats.twap_missed_end)} no final point
       </p>
       <p data-testid="recorded">
         Recorded {hours(stats.recorded_secs)} awake in {fmtInt(stats.sessions)}{' '}

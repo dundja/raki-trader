@@ -30,6 +30,8 @@ function nullWindow(over: Partial<LiveWindow> = {}): LiveWindow {
     up_ask: null,
     down_bid: null,
     down_ask: null,
+    prediction: null,
+    shadow: null,
     ...over,
   }
 }
@@ -84,6 +86,27 @@ afterEach(() => {
   cleanup()
   vi.useRealTimers()
   vi.unstubAllGlobals()
+})
+
+describe('WindowCard shadow', () => {
+  it('shows the model probability and the v0 shadow state', async () => {
+    await renderCard(
+      <WindowCard
+        window={fullWindow({
+          prediction: { p_up: 0.9731, mu: 80_041, sd: 3.2, spot_ts_ms: NOW - 1000 },
+          shadow: { last_eval: null, fill: null, pending: false },
+        })}
+      />,
+    )
+    expect(screen.getByTestId('model-p-up')).toHaveTextContent('97.3%')
+    expect(screen.getByTestId('v0-shadow')).toHaveTextContent('Waits for T−45 s')
+  })
+
+  it('assets v0 does not trade have no shadow line', async () => {
+    await renderCard(<WindowCard window={fullWindow({ asset: 'eth' })} />)
+    expect(screen.getByTestId('model-p-up')).toHaveTextContent('—')
+    expect(screen.queryByTestId('v0-shadow')).toBeNull()
+  })
 })
 
 describe('WindowCard', () => {

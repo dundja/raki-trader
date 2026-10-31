@@ -8,6 +8,8 @@ members = [
     "crates/store",
     "crates/api",
     "crates/traderd",
+    "crates/keytool",
+    "crates/strategy",
 ]
 
 [workspace.package]
@@ -27,6 +29,7 @@ raki-feeds = { path = "crates/feeds" }
 raki-engine = { path = "crates/engine" }
 raki-store = { path = "crates/store" }
 raki-api = { path = "crates/api" }
+raki-strategy = { path = "crates/strategy" }
 
 # shared
 anyhow = "1"
@@ -57,6 +60,12 @@ toml = "1"
 clap = { version = "4", features = ["derive"] }
 rsntp = "4"
 libc = "0.2"
+# Official SDK (github.com/Polymarket/rs-clob-client-v2), pinned exactly: fake "polymarket"
+# crates have stolen keys.
+polymarket_client_sdk_v2 = { version = "=0.9.0", default-features = false, features = ["clob"] }
+rpassword = "7.5"
+libm = "0.2.16"
+sha2 = "0.10.9"
 
 # dev
 wiremock = "0.6"

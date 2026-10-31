@@ -5,7 +5,10 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use raki_core::{Asset, Outcome, SeriesRow, Source, TradingMode, WindowRecord, WindowStatus};
+use raki_core::{
+    Asset, Outcome, PredictionRow, SeriesRow, ShadowAction, ShadowEvalRow, ShadowFillRow,
+    ShadowFillStatus, Source, TradingMode, WindowRecord, WindowStatus,
+};
 use raki_store::Store;
 use rust_decimal::Decimal;
 use sqlx::Row;
@@ -289,6 +292,28 @@ async fn recording_stats_counts() {
         .start_session(s2, raki_core::now_ms(), "v", "h")
         .await
         .unwrap();
+    // Awake 100 s .. 1000 s, except a sleep from 140 s to 160 s.
+    let s3 = Uuid::now_v7();
+    store.start_session(s3, 100_000, "v", "h").await.unwrap();
+    store.record_sleep(s3, 160_000, 20_000).await.unwrap();
+    store.end_session(s3, 1_000_000, "shutdown").await.unwrap();
+
+    let no_final = |slug: &str, asset, end_ts: i64| {
+        let mut w = window(slug, asset, end_ts - 300, s3);
+        w.status = WindowStatus::Complete;
+        w
+    };
+    for w in [
+        // Awake through the end + 10 s: missed. ETH ended before PolyBolt began (end 400).
+        no_final("m-eth", Asset::Eth, 30),
+        no_final("m-btc", Asset::Btc, 500),
+        // Not missed: asleep at the end; no session at the end; s1 ends before end + 10 s.
+        no_final("m-asleep", Asset::Btc, 150),
+        no_final("m-off", Asset::Btc, 70),
+        no_final("m-late", Asset::Btc, 55),
+    ] {
+        store.upsert_window(&w).await.unwrap();
+    }
 
     let with_final = |slug: &str, asset, start, final_source, matched: Option<bool>| {
         let mut w = window(slug, asset, start, s1);
@@ -341,9 +366,11 @@ async fn recording_stats_counts() {
     }
 
     let st = store.recording_stats().await.unwrap();
-    assert_eq!(st.sessions, 2);
-    assert!(st.recorded_secs >= 60, "got {}", st.recorded_secs);
-    assert_eq!(st.windows_total, 8, "upcoming excluded");
+    assert_eq!(st.sessions, 3);
+    assert!(st.recorded_secs >= 60 + 880, "got {}", st.recorded_secs);
+    assert_eq!(st.windows_total, 13, "upcoming excluded");
+    assert_eq!(st.twap_missed_end, 2);
+    assert_eq!(st.gate_twap_missed_end, 1, "BTC since the first PolyBolt final only");
     assert_eq!(st.windows_with_twap, 7);
     assert_eq!((st.twap_match, st.twap_mismatch), (3, 1));
     assert_eq!((st.twap_awaiting, st.twap_unverified), (2, 1));
@@ -610,4 +637,145 @@ async fn session_end_is_recorded() {
     );
     assert_eq!(r.get::<String, _>("version"), "0.1.0");
     assert_eq!(r.get::<String, _>("host"), "box");
+}
+
+fn shadow_eval(session: Uuid, seq: i64, slug: &str, action: ShadowAction) -> ShadowEvalRow {
+    ShadowEvalRow {
+        session_id: session.to_string(),
+        seq,
+        strategy_id: "v0".into(),
+        params_hash: "h1".into(),
+        slug: slug.into(),
+        ts_ms: 1_000 + seq,
+        secs_left: 45,
+        side: Some(Outcome::Up),
+        model_prob: Some(0.98),
+        market_prob: Some(dec("0.935")),
+        best_ask: Some(dec("0.94")),
+        walk_shares: Some(dec("5.3")),
+        walk_avg_price: Some(dec("0.94")),
+        walk_fee: Some(dec("0.021")),
+        edge: Some(dec("0.036")),
+        action,
+        reason: (action == ShadowAction::Skip).then(|| "edge".into()),
+    }
+}
+
+fn shadow_fill(session: Uuid, seq: i64, slug: &str, side: Outcome, status: ShadowFillStatus) -> ShadowFillRow {
+    ShadowFillRow {
+        session_id: session.to_string(),
+        seq,
+        slug: slug.into(),
+        side,
+        decided_ms: 1_000,
+        due_ms: 1_250,
+        filled_ms: 1_300 + seq,
+        limit_price: dec("0.94"),
+        shares: dec("5"),
+        cost: dec("4.7"),
+        fee: dec("0.02"),
+        status,
+        winner: None,
+        pnl: None,
+    }
+}
+
+#[tokio::test]
+async fn shadow_rows_summary_and_calibration() {
+    let store = fresh_store().await;
+    let s = Uuid::now_v7();
+    store.start_session(s, 1, "v", "h").await.unwrap();
+    // Two resolved windows (Up won both) and one still open.
+    for (slug, start, winner) in [("w-up", 0, Some(Outcome::Up)), ("w-up2", 300, Some(Outcome::Up)), ("w-open", 600, None)] {
+        let mut w = window(slug, Asset::Btc, start, s);
+        w.winner = winner;
+        w.status = if winner.is_some() { WindowStatus::Resolved } else { WindowStatus::Live };
+        store.upsert_window(&w).await.unwrap();
+    }
+    store
+        .upsert_strategy_params("h1", "v0", &serde_json::json!({"v0": {"min_edge": "0.01"}}), 5)
+        .await
+        .unwrap();
+
+    let pred = |slug: &str, checkpoint_s, p_up| PredictionRow {
+        slug: slug.into(),
+        asset: Asset::Btc,
+        checkpoint_s,
+        ts_ms: 10,
+        p_up,
+        mu: 100.0,
+        sd: 1.0,
+        sigma: 0.1,
+        ptb: 99.0,
+        spot: 100.0,
+        twap: Some(100.0),
+        binance_mid_usd: None,
+        coinbase_mid: None,
+        up_bid: Some(dec("0.95")),
+        up_ask: None,
+        down_bid: None,
+        down_ask: Some(dec("0.05")),
+        model_id: "twap-gauss-v0".into(),
+        session_id: s.to_string(),
+    };
+    for p in [pred("w-up", 30, 0.96), pred("w-up2", 30, 0.04), pred("w-up", 60, 0.7), pred("w-open", 30, 0.99)] {
+        store.insert_prediction(&p).await.unwrap();
+        store.insert_prediction(&p).await.unwrap(); // a retry is a no-op
+    }
+    let preds = store.window_predictions("w-up").await.unwrap();
+    assert_eq!(preds.iter().map(|p| p.checkpoint_s).collect::<Vec<_>>(), [60, 30]);
+    assert_eq!(preds[1], pred("w-up", 30, 0.96), "round trip");
+
+    for e in [
+        shadow_eval(s, 0, "w-up", ShadowAction::Skip),
+        shadow_eval(s, 1, "w-up", ShadowAction::Enter),
+        shadow_eval(s, 2, "w-up2", ShadowAction::Enter),
+        shadow_eval(s, 3, "w-up2", ShadowAction::Enter),
+        shadow_eval(s, 4, "w-open", ShadowAction::Enter),
+    ] {
+        store.insert_shadow_eval(&e).await.unwrap();
+        store.insert_shadow_eval(&e).await.unwrap();
+    }
+    assert_eq!(store.window_shadow_evals("w-up").await.unwrap()[1], shadow_eval(s, 1, "w-up", ShadowAction::Enter));
+    for f in [
+        // Up won: +5 − 4.7 − 0.02 = 0.28.
+        shadow_fill(s, 1, "w-up", Outcome::Up, ShadowFillStatus::Filled),
+        // A no-fill, then a Down fill that lost: −4.72.
+        shadow_fill(s, 2, "w-up2", Outcome::Down, ShadowFillStatus::NoFill),
+        shadow_fill(s, 3, "w-up2", Outcome::Down, ShadowFillStatus::Partial),
+        // Not resolved yet.
+        shadow_fill(s, 4, "w-open", Outcome::Up, ShadowFillStatus::Filled),
+    ] {
+        store.insert_shadow_fill(&f).await.unwrap();
+        store.insert_shadow_fill(&f).await.unwrap();
+    }
+
+    let fills = store.shadow_fills(Some("w-up"), 10).await.unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!((fills[0].winner, fills[0].pnl), (Some(Outcome::Up), Some(dec("0.28"))));
+    let all = store.shadow_fills(None, 10).await.unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0].slug, "w-open", "newest first");
+    assert_eq!(all[0].pnl, None);
+    assert_eq!(all.iter().find(|f| f.seq == 2).unwrap().pnl, None, "a no-fill has no PnL");
+
+    let sum = store.shadow_summary().await.unwrap();
+    assert_eq!((sum.evaluations, sum.windows_evaluated, sum.windows_entered, sum.entries), (5, 3, 3, 4));
+    assert_eq!((sum.filled, sum.partial, sum.no_fill), (2, 1, 1));
+    assert_eq!((sum.resolved, sum.wins, sum.losses), (2, 1, 1));
+    assert_eq!(sum.staked, dec("9.44"));
+    assert_eq!(sum.pnl, dec("-4.44"));
+    assert!((sum.mean_predicted_edge.unwrap() - 0.036).abs() < 1e-12);
+    assert_eq!(sum.skip_reasons.len(), 1);
+    assert_eq!((sum.skip_reasons[0].reason.as_str(), sum.skip_reasons[0].count), ("edge", 1));
+    assert_eq!(sum.params_hashes, ["h1"]);
+
+    // At 30 s: w-up favoured Up at 0.96 (won), w-up2 favoured Down at 0.96 (lost); w-open has no
+    // winner yet.
+    let cal = store.calibration(30, Some(Asset::Btc)).await.unwrap();
+    assert_eq!(cal.n, 2);
+    let b = cal.buckets.iter().find(|b| b.label == "0.95–0.97").unwrap();
+    assert_eq!((b.n, b.realized), (2, Some(0.5)));
+    assert_eq!(store.calibration(30, Some(Asset::Eth)).await.unwrap().n, 0);
+    assert_eq!(store.calibration(60, None).await.unwrap().n, 1);
 }

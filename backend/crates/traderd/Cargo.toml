@@ -14,6 +14,7 @@ raki-feeds = { workspace = true }
 raki-engine = { workspace = true }
 raki-store = { workspace = true }
 raki-api = { workspace = true }
+raki-strategy = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
@@ -29,9 +30,12 @@ chrono = { workspace = true }
 tokio-util = { workspace = true }
 rsntp = { workspace = true }
 libc = { workspace = true }
+zstd = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 sqlx = { workspace = true }
 testcontainers-modules = { workspace = true }
+tempfile = { workspace = true }

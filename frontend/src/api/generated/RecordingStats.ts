@@ -35,6 +35,16 @@ twap_unverified: number,
  */
 gate_windows: number, gate_twap_match: number, gate_twap_mismatch: number, gate_twap_awaiting: number, gate_twap_unverified: number, 
 /**
+ * Windows recorded (awake) through their end that still have no final TWAP point: the feed
+ * never sent the point for the end second. All assets and sources.
+ */
+twap_missed_end: number, 
+/**
+ * The same for BTC windows that ended since PolyBolt recording began: gaps the M1 gate
+ * has to explain.
+ */
+gate_twap_missed_end: number, 
+/**
  * Number of gate windows needed to pass the M1 gate (500).
  */
 gate_target_windows: number, };

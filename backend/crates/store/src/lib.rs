@@ -16,8 +16,15 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
+mod shadow;
+pub use shadow::calibrate;
+
 /// Gate windows (BTC, final TWAP from PolyBolt) needed to pass the M1 gate.
 const GATE_TARGET_WINDOWS: i64 = 500;
+
+/// How long after a window's end its final TWAP point must have arrived: the feeds publish each
+/// second's point within about a second, so 10 s leaves a wide margin.
+const END_POINT_GRACE_MS: i64 = 10_000;
 
 /// A store call waits at most this long for a pooled connection: with Postgres down, calls fail
 /// fast instead of hanging for sqlx's default 30 s.
@@ -403,15 +410,28 @@ impl Store {
         .fetch_one(&self.pool)
         .await
         .context("session stats")?;
-        // `g` marks a gate window: BTC with a PolyBolt final TWAP (CLAUDE.md §5).
+        // `g` marks a gate window: BTC with a PolyBolt final TWAP (CLAUDE.md §5). `missed_end`:
+        // no final TWAP although a session was running and awake from the window end until
+        // the point should have arrived, so the feed never sent it (or we lost it).
         let windows = sqlx::query(
-            "with w as ( \
+            "with first_pb as ( \
+               select min(end_ts) as t from windows \
+               where asset = 'btc' and final_twap_source = 'polybolt'), \
+             w as ( \
                select *, (asset = 'btc' and final_twap_source = 'polybolt' \
                           and final_twap_ours is not null) as g, \
                  (final_twap_ours is not null and twap_match is null \
                   and status <> 'timed_out') as awaiting, \
                  (final_twap_ours is not null and twap_match is null \
-                  and status = 'timed_out') as unverified \
+                  and status = 'timed_out') as unverified, \
+                 (final_twap_ours is null and status not in ('upcoming', 'live') \
+                  and exists (select 1 from sessions s where s.started_ms <= end_ts * 1000 \
+                              and coalesce(s.ended_ms, $1) >= end_ts * 1000 + $2) \
+                  and not exists (select 1 from feed_gaps f \
+                              where f.source = 'system' and f.reason = 'sleep' \
+                              and f.at_ms <= end_ts * 1000 + $2 \
+                              and f.at_ms + coalesce(f.duration_ms, 0) >= end_ts * 1000)) \
+                   as missed_end \
                from windows) \
              select count(*) filter (where status <> 'upcoming') as total, \
              count(*) filter (where final_twap_ours is not null) as with_twap, \
@@ -423,9 +443,14 @@ impl Store {
              count(*) filter (where g and twap_match is true) as gate_matched, \
              count(*) filter (where g and twap_match is false) as gate_mismatched, \
              count(*) filter (where g and awaiting) as gate_awaiting, \
-             count(*) filter (where g and unverified) as gate_unverified \
+             count(*) filter (where g and unverified) as gate_unverified, \
+             count(*) filter (where missed_end) as missed_end, \
+             count(*) filter (where missed_end and asset = 'btc' \
+                              and end_ts >= (select t from first_pb)) as gate_missed_end \
              from w",
         )
+        .bind(now_ms)
+        .bind(END_POINT_GRACE_MS)
         .fetch_one(&self.pool)
         .await
         .context("window stats")?;
@@ -444,6 +469,8 @@ impl Store {
             gate_twap_mismatch: windows.try_get("gate_mismatched")?,
             gate_twap_awaiting: windows.try_get("gate_awaiting")?,
             gate_twap_unverified: windows.try_get("gate_unverified")?,
+            twap_missed_end: windows.try_get("missed_end")?,
+            gate_twap_missed_end: windows.try_get("gate_missed_end")?,
             gate_target_windows: GATE_TARGET_WINDOWS,
         })
     }

@@ -618,9 +618,18 @@ async fn polybolt_seq_gap_is_recorded() {
     assert_eq!(gap["channel"], "price.crypto.twap");
     assert_eq!(gap["expected"], 2);
     assert_eq!(gap["got"], 3);
-    // Both frames still produce their events.
+    // Both frames still produce their events, and the gap reaches the engine before the second.
     assert!(matches!(h.next_event().await, FeedEvent::FeedReset { .. }));
     assert!(matches!(h.next_event().await, FeedEvent::Oracle { .. }));
+    assert_eq!(
+        h.next_event().await,
+        FeedEvent::SeqGap {
+            source: Source::Polybolt,
+            channel: "price.crypto.twap".into(),
+            expected: 2,
+            got: 3,
+        }
+    );
     assert!(matches!(h.next_event().await, FeedEvent::Oracle { .. }));
 
     h.stop(runner).await;

@@ -86,3 +86,26 @@ export function fmtLocal(ms: number | null | undefined): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
+
+/** A 0..1 probability as a percentage: 0.9731 → "97.3%". null/invalid → "—". */
+export function fmtPct(v: number | null | undefined, digits = 1): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return DASH
+  return `${(v * 100).toFixed(digits)}%`
+}
+
+/** Dollars with an explicit sign ("+0.28", "-4.72"); decimals arrive as strings. Display only. */
+export function fmtUsd(v: string | number | null | undefined, digits = 2): string {
+  return fmtSigned(toNumber(v), digits)
+}
+
+/** A per-share price difference (0..1 dollars) as signed cents: "0.036" → "+3.6¢". */
+export function fmtCents(v: string | number | null | undefined, digits = 1): string {
+  const n = toNumber(v)
+  if (n === null) return DASH
+  return `${fmtSigned(n * 100, digits)}¢`
+}
+
+/** A decimal string or number with fixed digits ("5.2083…" → "5.21"). null/invalid → "—". */
+export function fmtNum(v: string | number | null | undefined, digits = 2): string {
+  return fmtPrice(v, digits)
+}

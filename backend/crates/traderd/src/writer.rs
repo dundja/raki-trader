@@ -8,6 +8,7 @@
 //! - window records are kept per slug, newest wins (a record is the full state, and the store
 //!   merges it without regressing anything), so a retry always writes the latest state;
 //! - series rows, gaps, sleeps and control audits are kept in order, up to a bound;
+//! - shadow rows (predictions, v0 evaluations and fills) likewise; their inserts are idempotent;
 //! - after a failure the writer waits (1 s doubling to 10 s) and retries everything pending.
 //!
 //! [`WriterStats`] reports pending writes and the last error, which the health snapshot turns into
@@ -19,7 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use raki_core::{SeriesRow, Source, StoreStatus, TradingMode, WindowRecord, now_ms};
+use raki_core::{
+    PredictionRow, SeriesRow, ShadowEvalRow, ShadowFillRow, Source, StoreStatus, TradingMode,
+    WindowRecord, now_ms,
+};
 use raki_store::Store;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -34,6 +38,9 @@ const RETRY_MAX: Duration = Duration::from_secs(10);
 const MAX_PENDING_SERIES: usize = 12_000;
 /// Gaps, sleeps and audits kept while the store is failing.
 const MAX_PENDING_EVENTS: usize = 5_000;
+/// Shadow rows kept while the store is failing (about an hour: ~40 predictions and ~16
+/// evaluations per 5-minute window).
+const MAX_PENDING_SHADOW: usize = 5_000;
 /// The channel from the engine loop.
 pub const WRITER_CAPACITY: usize = 50_000;
 
@@ -71,6 +78,15 @@ pub enum Write {
     Heartbeat {
         at_ms: i64,
     },
+    Shadow(ShadowWrite),
+}
+
+/// A shadow row (docs/specs/2026-10-31-shadow-predictions.md).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShadowWrite {
+    Prediction(PredictionRow),
+    Eval(ShadowEvalRow),
+    Fill(ShadowFillRow),
 }
 
 /// The store calls the writer makes. [`Store`] is the real one; tests use a fake that fails.
@@ -96,6 +112,7 @@ pub trait Sink: Send + Sync + 'static {
         session: Uuid,
         at_ms: i64,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn insert_shadow(&self, w: &ShadowWrite) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 impl Sink for Store {
@@ -137,6 +154,14 @@ impl Sink for Store {
 
     async fn heartbeat(&self, session: Uuid, at_ms: i64) -> anyhow::Result<()> {
         Store::heartbeat(self, session, at_ms).await
+    }
+
+    async fn insert_shadow(&self, w: &ShadowWrite) -> anyhow::Result<()> {
+        match w {
+            ShadowWrite::Prediction(p) => self.insert_prediction(p).await,
+            ShadowWrite::Eval(e) => self.insert_shadow_eval(e).await,
+            ShadowWrite::Fill(f) => self.insert_shadow_fill(f).await,
+        }
     }
 }
 
@@ -205,6 +230,7 @@ pub fn spawn_writer<S: Sink>(sink: S, session: Uuid) -> (WriterTx, tokio::task::
         windows: BTreeMap::new(),
         series: VecDeque::new(),
         events: VecDeque::new(),
+        shadow: VecDeque::new(),
         heartbeat: None,
         retry_at: None,
         retry_delay: RETRY_MIN,
@@ -239,6 +265,7 @@ struct Writer<S> {
     windows: BTreeMap<String, WindowRecord>,
     series: VecDeque<SeriesRow>,
     events: VecDeque<Event>,
+    shadow: VecDeque<ShadowWrite>,
     heartbeat: Option<i64>,
     /// Set after a failure: nothing is attempted before it.
     retry_at: Option<Instant>,
@@ -316,6 +343,14 @@ impl<S: Sink> Writer<S> {
                 self.push_event(Event::Sleep { wake_ms, slept_ms })
             }
             Write::Heartbeat { at_ms } => self.heartbeat = Some(at_ms),
+            Write::Shadow(w) => {
+                if self.shadow.len() >= MAX_PENDING_SHADOW {
+                    self.shadow.pop_front();
+                    self.stats.count_dropped(1);
+                    tracing::error!("store failing too long: oldest shadow row dropped");
+                }
+                self.shadow.push_back(w);
+            }
         }
         self.publish_pending();
     }
@@ -330,7 +365,7 @@ impl<S: Sink> Writer<S> {
     }
 
     fn pending(&self) -> u64 {
-        (self.windows.len() + self.series.len() + self.events.len()) as u64
+        (self.windows.len() + self.series.len() + self.events.len() + self.shadow.len()) as u64
             + u64::from(self.heartbeat.is_some())
     }
 
@@ -399,6 +434,11 @@ impl<S: Sink> Writer<S> {
             call(self.sink.insert_series(&rows)).await?;
             self.series.clear();
         }
+        // Windows first: a fill or evaluation is read back joined with its window.
+        while let Some(w) = self.shadow.front() {
+            call(self.sink.insert_shadow(w)).await?;
+            self.shadow.pop_front();
+        }
         if let Some(at_ms) = self.heartbeat {
             call(self.sink.heartbeat(self.session, at_ms)).await?;
             self.heartbeat = None;
@@ -433,6 +473,7 @@ mod tests {
         audits: Arc<Mutex<Vec<&'static str>>>,
         sleeps: Arc<Mutex<Vec<(i64, i64)>>>,
         heartbeats: Arc<Mutex<Vec<i64>>>,
+        shadow: Arc<Mutex<Vec<ShadowWrite>>>,
     }
 
     impl Fake {
@@ -474,6 +515,11 @@ mod tests {
         async fn heartbeat(&self, _: Uuid, at_ms: i64) -> anyhow::Result<()> {
             self.check()?;
             self.heartbeats.lock().unwrap().push(at_ms);
+            Ok(())
+        }
+        async fn insert_shadow(&self, w: &ShadowWrite) -> anyhow::Result<()> {
+            self.check()?;
+            self.shadow.lock().unwrap().push(w.clone());
             Ok(())
         }
     }
@@ -521,6 +567,30 @@ mod tests {
         }
     }
 
+    fn prediction(slug: &str) -> ShadowWrite {
+        ShadowWrite::Prediction(PredictionRow {
+            slug: slug.into(),
+            asset: Asset::Btc,
+            checkpoint_s: 30,
+            ts_ms: 1,
+            p_up: 0.9,
+            mu: 1.0,
+            sd: 0.1,
+            sigma: 0.01,
+            ptb: 0.9,
+            spot: 1.0,
+            twap: None,
+            binance_mid_usd: None,
+            coinbase_mid: None,
+            up_bid: None,
+            up_ask: None,
+            down_bid: None,
+            down_ask: None,
+            model_id: "m".into(),
+            session_id: Uuid::nil().to_string(),
+        })
+    }
+
     async fn eventually(mut f: impl FnMut() -> bool) {
         for _ in 0..400 {
             if f() {
@@ -552,9 +622,11 @@ mod tests {
             slept_ms: 4,
         });
         tx.send(Write::Heartbeat { at_ms: 10 });
+        tx.send(Write::Shadow(prediction("a")));
+        tx.send(Write::Shadow(prediction("b")));
         eventually(|| !stats.status().ok).await;
         let st = stats.status();
-        assert_eq!(st.pending_writes, 6, "{st:?}");
+        assert_eq!(st.pending_writes, 8, "{st:?}");
         assert!(
             st.last_error
                 .as_deref()
@@ -571,6 +643,11 @@ mod tests {
         assert_eq!(*fake.gaps.lock().unwrap(), ["reconnect"]);
         assert_eq!(*fake.sleeps.lock().unwrap(), [(9, 4)]);
         assert_eq!(*fake.heartbeats.lock().unwrap(), [10]);
+        assert_eq!(
+            *fake.shadow.lock().unwrap(),
+            [prediction("a"), prediction("b")],
+            "shadow rows in order"
+        );
         assert!(stats.status().last_ok_ms.is_some());
 
         drop(tx);

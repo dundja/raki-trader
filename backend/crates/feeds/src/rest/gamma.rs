@@ -41,6 +41,7 @@ struct Market {
     crypto_market_config: Option<CryptoConfig>,
     fee_schedule: Option<FeeSchedule>,
     order_price_min_tick_size: Option<f64>,
+    order_min_size: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +53,7 @@ struct CryptoConfig {
 #[derive(Deserialize)]
 struct FeeSchedule {
     rate: Option<f64>,
+    exponent: Option<f64>,
 }
 
 fn unix_s(field: &str, s: &str) -> Result<i64, RestError> {
@@ -115,7 +117,9 @@ pub fn parse_gamma_event(body: &str) -> Result<GammaWindow, RestError> {
             .as_ref()
             .and_then(|c| c.twap_lookback_seconds),
         fee_rate: m.fee_schedule.as_ref().and_then(|f| f.rate),
+        fee_exponent: m.fee_schedule.as_ref().and_then(|f| f.exponent),
         tick_size: m.order_price_min_tick_size,
+        order_min_size: m.order_min_size,
     })
 }
 

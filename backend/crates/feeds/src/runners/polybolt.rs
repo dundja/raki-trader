@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use raki_core::{Asset, Source};
+use raki_core::{Asset, FeedEvent, Source};
 use raki_recorder::RecordKind;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -232,6 +232,12 @@ impl Polybolt {
                 "got": got,
             });
             link.record(RecordKind::Gap, gap.to_string());
+            link.emit(FeedEvent::SeqGap {
+                source: Source::Polybolt,
+                channel,
+                expected,
+                got,
+            });
         }
         match parse_polybolt(text, recv_ms) {
             Ok(PolyboltFrame::Events(events)) => link.forward(Ok(events)),

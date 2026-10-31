@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as HealthRouteImport } from './routes/health'
+import { Route as ShadowRouteImport } from './routes/shadow'
 import { Route as WindowsIndexRouteImport } from './routes/windows.index'
 import { Route as WindowsSlugRouteImport } from './routes/windows.$slug'
 
@@ -22,6 +23,11 @@ const IndexRoute = IndexRouteImport.update({
 const HealthRoute = HealthRouteImport.update({
   id: '/health',
   path: '/health',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ShadowRoute = ShadowRouteImport.update({
+  id: '/shadow',
+  path: '/shadow',
   getParentRoute: () => rootRouteImport,
 } as any)
 const WindowsIndexRoute = WindowsIndexRouteImport.update({
@@ -38,12 +44,14 @@ const WindowsSlugRoute = WindowsSlugRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/shadow': typeof ShadowRoute
   '/windows/$slug': typeof WindowsSlugRoute
   '/windows/': typeof WindowsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/shadow': typeof ShadowRoute
   '/windows/$slug': typeof WindowsSlugRoute
   '/windows': typeof WindowsIndexRoute
 }
@@ -51,20 +59,22 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/health': typeof HealthRoute
+  '/shadow': typeof ShadowRoute
   '/windows/$slug': typeof WindowsSlugRoute
   '/windows/': typeof WindowsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/health' | '/windows/$slug' | '/windows/'
+  fullPaths: '/' | '/health' | '/shadow' | '/windows/$slug' | '/windows/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/health' | '/windows/$slug' | '/windows'
-  id: '__root__' | '/' | '/health' | '/windows/$slug' | '/windows/'
+  to: '/' | '/health' | '/shadow' | '/windows/$slug' | '/windows'
+  id: '__root__' | '/' | '/health' | '/shadow' | '/windows/$slug' | '/windows/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   HealthRoute: typeof HealthRoute
+  ShadowRoute: typeof ShadowRoute
   WindowsSlugRoute: typeof WindowsSlugRoute
   WindowsIndexRoute: typeof WindowsIndexRoute
 }
@@ -83,6 +93,13 @@ declare module '@tanstack/react-router' {
       path: '/health'
       fullPath: '/health'
       preLoaderRoute: typeof HealthRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/shadow': {
+      id: '/shadow'
+      path: '/shadow'
+      fullPath: '/shadow'
+      preLoaderRoute: typeof ShadowRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/windows/': {
@@ -105,6 +122,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   HealthRoute: HealthRoute,
+  ShadowRoute: ShadowRoute,
   WindowsSlugRoute: WindowsSlugRoute,
   WindowsIndexRoute: WindowsIndexRoute,
 }

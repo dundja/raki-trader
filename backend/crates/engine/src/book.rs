@@ -46,6 +46,11 @@ impl BookState {
     pub fn best_ask(&self) -> Option<Decimal> {
         self.asks.first_key_value().map(|(p, _)| *p)
     }
+
+    /// (price, size), ascending by price.
+    pub fn asks(&self) -> Vec<(Decimal, Decimal)> {
+        self.asks.iter().map(|(p, s)| (*p, *s)).collect()
+    }
 }
 
 fn to_levels(levels: &[Level]) -> BTreeMap<Decimal, Decimal> {

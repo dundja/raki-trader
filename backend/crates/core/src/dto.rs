@@ -248,6 +248,10 @@ pub struct LiveWindow {
     #[serde(with = "rust_decimal::serde::str_option")]
     #[ts(type = "string | null")]
     pub down_ask: Option<Decimal>,
+    /// The model's latest forecast (shadow; not a gate).
+    pub prediction: Option<crate::LivePrediction>,
+    /// Strategy v0's shadow state; `None` for assets v0 does not trade.
+    pub shadow: Option<crate::LiveShadow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
@@ -311,6 +315,14 @@ pub struct RecordingStats {
     pub gate_twap_awaiting: i64,
     #[ts(type = "number")]
     pub gate_twap_unverified: i64,
+    /// Windows recorded (awake) through their end that still have no final TWAP point: the feed
+    /// never sent the point for the end second. All assets and sources.
+    #[ts(type = "number")]
+    pub twap_missed_end: i64,
+    /// The same for BTC windows that ended since PolyBolt recording began: gaps the M1 gate
+    /// has to explain.
+    #[ts(type = "number")]
+    pub gate_twap_missed_end: i64,
     /// Number of gate windows needed to pass the M1 gate (500).
     #[ts(type = "number")]
     pub gate_target_windows: i64,

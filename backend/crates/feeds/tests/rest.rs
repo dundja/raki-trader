@@ -60,7 +60,9 @@ fn gamma_resolved_fixture() {
     assert!(w.closed);
     assert_eq!(w.twap_lookback_s, Some(60));
     assert_eq!(w.fee_rate, Some(0.07));
+    assert_eq!(w.fee_exponent, Some(1.0));
     assert_eq!(w.tick_size, Some(0.001));
+    assert_eq!(w.order_min_size, Some(5.0));
     assert_eq!(
         w.condition_id,
         "0xa7d83c9fafffeb7efb196ecb527904892095d198649e841f2be1511398204d3e"

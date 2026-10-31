@@ -302,8 +302,9 @@ Polymarket changed fees three times in 2026. It also changed the taker delay (25
 - Money and prices use `Decimal` and timestamps are UTC. Store the source and receive timestamps separately.
 - Keep strategy code free of I/O so it runs the same in replay, paper and live.
 - **Commands.** Run from the repo root unless noted. `README.md` ("Run M1 locally") has the details.
-  - Run everything: `make dev` (Postgres, then traderd and the dashboard; Ctrl-C stops both, `make db-down` stops Postgres).
+  - Run everything: `make dev` (Postgres, then traderd, the dashboard and the low-priority raw recompressor; Ctrl-C stops all three, `make db-down` stops Postgres).
   - One at a time: `make db-up`, `make backend-run` (API on `127.0.0.1:8787`), `make frontend-dev` (dashboard on `http://localhost:3000`).
+ - PolyBolt credentials: `make poly-creds` (the user runs it; it prompts for the signer key and writes `~/.config/raki-trader/poly.env`, which `make backend-run` loads). Never run it or read that file yourself.
   - Build: `cargo build --release --manifest-path backend/Cargo.toml`; `cd frontend && pnpm build`.
   - Test everything: `make test` (backend `cargo test --workspace` plus frontend `vitest run`).
   - Backend only: `make backend-test`; lint with `cd backend && cargo clippy --workspace --all-targets -- -D warnings`.

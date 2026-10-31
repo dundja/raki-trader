@@ -62,4 +62,10 @@ export const qk = {
     ['windows', asset, before] as const,
   window: (slug: string) => ['window', slug] as const,
   series: (slug: string) => ['series', slug] as const,
+  predictions: (slug: string) => ['predictions', slug] as const,
+  windowShadow: (slug: string) => ['window-shadow', slug] as const,
+  shadowSummary: ['shadow-summary'],
+  shadowFills: ['shadow-fills'],
+  calibration: (checkpoint: number, asset: string | null) =>
+    ['calibration', checkpoint, asset] as const,
 } as const

@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { PredictionRow } from '../src/api/generated/PredictionRow'
 import type { SeriesRow } from '../src/api/generated/SeriesRow'
 import type { WindowRecord } from '../src/api/generated/WindowRecord'
 import { priceTicks, toChartPoints, toQuotePoints } from '../src/components/WindowChart'
@@ -70,6 +71,13 @@ function series(over: Partial<SeriesRow> = {}): SeriesRow {
 
 function json(body: unknown): Promise<Response> {
   return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }))
+}
+
+/** The window detail page's requests: the record, its series, predictions and shadow. */
+function detailBody(url: string, w: WindowRecord): unknown {
+  if (url.endsWith('/series') || url.endsWith('/predictions')) return []
+  if (url.endsWith('/shadow')) return { evals: [], fills: [] }
+  return w
 }
 
 async function renderPage(ui: ReactNode) {
@@ -248,10 +256,7 @@ describe('MatchBadge', () => {
 describe('window detail', () => {
   it('detail renders empty-series message', async () => {
     const w = rec(0)
-    vi.stubGlobal(
-      'fetch',
-      vi.fn((url: string) => json(url.endsWith('/series') ? [] : w)),
-    )
+    vi.stubGlobal('fetch', vi.fn((url: string) => json(detailBody(url, w))))
     await renderPage(<WindowDetailPage slug={w.slug} />)
     expect(
       await screen.findByText(
@@ -259,6 +264,49 @@ describe('window detail', () => {
       ),
     ).toBeInTheDocument()
     expect(screen.getByText(w.slug)).toBeInTheDocument()
+    expect(screen.queryByTestId('predictions')).toBeNull()
+  })
+
+  it('shows the model predictions and whether the favourite won', async () => {
+    const w = rec(0, { winner: 'Up' })
+    const prediction = (checkpoint_s: number, p_up: number): PredictionRow => ({
+      slug: w.slug,
+      asset: 'btc',
+      checkpoint_s,
+      ts_ms: 0,
+      p_up,
+      mu: 80_041,
+      sd: 3.2,
+      sigma: 0.4,
+      ptb: 80_000,
+      spot: 80_040,
+      twap: 80_039,
+      binance_mid_usd: null,
+      coinbase_mid: null,
+      up_bid: '0.95',
+      up_ask: '0.96',
+      down_bid: null,
+      down_ask: null,
+      model_id: 'twap-gauss-v0',
+      session_id: 's',
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        json(
+          url.endsWith('/predictions')
+            ? [prediction(60, 0.42), prediction(30, 0.973)]
+            : detailBody(url, w),
+        ),
+      ),
+    )
+    await renderPage(<WindowDetailPage slug={w.slug} />)
+    const table = await screen.findByTestId('predictions')
+    const rows = within(table).getAllByRole('row')
+    expect(rows[1]).toHaveTextContent('42.0%')
+    expect(rows[1]).toHaveTextContent('no')
+    expect(rows[2]).toHaveTextContent('97.3%')
+    expect(rows[2]).toHaveTextContent('yes')
   })
 
   it('shows a not-found message for an unknown slug', async () => {

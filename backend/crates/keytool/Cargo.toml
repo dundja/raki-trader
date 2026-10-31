@@ -1,0 +1,25 @@
+[package]
+name = "raki-keytool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Kept out of traderd so the recorder never links the signing SDK or sees the private key.
+[[bin]]
+name = "derive-creds"
+path = "src/main.rs"
+
+[dependencies]
+polymarket_client_sdk_v2 = { workspace = true }
+rpassword = { workspace = true }
+secrecy = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

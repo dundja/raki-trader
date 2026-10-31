@@ -57,8 +57,12 @@ raw file. `make db-down` stops Postgres. The data volume `raki-pg` is kept.
 ### Where data lives
 
 - **Raw frames** go to `data/raw/YYYY-MM-DD/HH-<session>-<n>.ndjson.zst` (gitignored). They are the
-  source of truth for replay and are never deleted. Expect a few hundred MB of compressed data per
-  hour, since all three assets' CLOB books are recorded.
+  source of truth for replay and are never deleted. Expect about 230 MB of compressed data per
+  hour (85% of it CLOB book deltas), since all three assets' CLOB books are recorded.
+  - `make dev` also runs `make recompress` at the lowest CPU priority: once an hourly file has not
+    changed for 10 minutes it is recompressed at zstd level 19 (about 30% smaller), checked to
+    decode to the identical bytes, and only then replaces the original. `data/raw/.recompressed`
+    lists the files done; truncated files are left as they are.
 - **Postgres** (volume `raki-pg`) holds sessions, windows (with the TWAP-vs-Gamma comparison),
   the per-window 1 s series, feed gaps and the audit log of control actions.
 - Each start opens a new session, which is stored in Postgres (`sessions`) and in the raw stream
@@ -78,6 +82,14 @@ It prints per-source record counts and `truncated=true|false`.
   and `POLY_API_PASSPHRASE` are all set in the environment. Never put them in the config file.
   Until then, the legacy RTDS feed supplies the TWAP, and each window's `twap_source` says which
   feed it came from.
+  - These are the CLOB API credentials. polymarket.com has no page for them (its Settings → API
+    Keys page shows Relayer and Builder keys, which are different); they are derived from the
+    signer's private key. Run `make poly-creds` once: it asks for the key (input hidden), signs
+    one L1 auth message, and writes the three values to `~/.config/raki-trader/poly.env`
+    (mode 600). The key itself is not stored. It is idempotent, so rerunning returns the same
+    credentials (pass `--force` through `cargo run` to overwrite the file).
+  - `make backend-run` and `make dev` load that file when it exists (`POLY_ENV=<path>` to
+    use another one).
 - **Overrides.** `RAKI_DATABASE_URL` and `RAKI_API_BIND` override the config file. `RUST_LOG`
   sets the log level (default `info`).
 - **Clock.** Trading safety requires an NTP offset of 50 ms or less. Above that the bot pauses

@@ -86,6 +86,13 @@ a {
   color: var(--banner-text);
 }
 
+.banner-warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-radius: 6px;
+  margin: 0;
+}
+
 .topbar {
   display: flex;
   align-items: center;
