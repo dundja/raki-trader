@@ -15,7 +15,11 @@ walk_shares: string | null, walk_avg_price: string | null, walk_fee: string | nu
  */
 edge: string | null, action: ShadowAction, 
 /**
- * Why it skipped (`not_running`, `no_prediction`, `market_config`, `no_book`,
- * `no_favourite`, `no_liquidity`, `edge`).
+ * Why it skipped (`unsafe`, `no_prediction`, `market_config`, `no_book`, `no_favourite`,
+ * `no_liquidity`, `edge`; `not_running` in rows from before the shadow ignored pauses).
  */
-reason: string | null, };
+reason: string | null, 
+/**
+ * Control was `running` (a live bot would have traded); false while paused.
+ */
+control_running: boolean, };

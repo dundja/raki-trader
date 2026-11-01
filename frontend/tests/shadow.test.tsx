@@ -31,6 +31,7 @@ function evalRow(over: Partial<ShadowEvalRow> = {}): ShadowEvalRow {
     edge: '0.036052',
     action: 'enter',
     reason: null,
+    control_running: true,
     ...over,
   }
 }
@@ -101,6 +102,7 @@ describe('Shadow page views', () => {
   it('summary shows fills, PnL and skip reasons', () => {
     const s: ShadowSummary = {
       evaluations: 160,
+      evaluations_while_paused: 20,
       windows_evaluated: 10,
       windows_entered: 3,
       entries: 4,
@@ -129,6 +131,7 @@ describe('Shadow page views', () => {
     expect(reasons).toHaveTextContent('no side at 92¢ or more')
     expect(reasons).toHaveTextContent('75.0%')
     expect(screen.getByText(/954ed69967b57fe0/)).toBeInTheDocument()
+    expect(within(summary).getByText('…while the bot was paused').closest('div')).toHaveTextContent('20')
   })
 
   it('calibration flags a bucket whose interval lies below the prediction', () => {

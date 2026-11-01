@@ -105,9 +105,11 @@ pub struct ShadowEvalRow {
     #[ts(type = "string | null")]
     pub edge: Option<Decimal>,
     pub action: ShadowAction,
-    /// Why it skipped (`not_running`, `no_prediction`, `market_config`, `no_book`,
-    /// `no_favourite`, `no_liquidity`, `edge`).
+    /// Why it skipped (`unsafe`, `no_prediction`, `market_config`, `no_book`, `no_favourite`,
+    /// `no_liquidity`, `edge`; `not_running` in rows from before the shadow ignored pauses).
     pub reason: Option<String>,
+    /// Control was `running` (a live bot would have traded); false while paused.
+    pub control_running: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -186,6 +188,9 @@ pub struct ReasonCount {
 pub struct ShadowSummary {
     #[ts(type = "number")]
     pub evaluations: i64,
+    /// Of those, made while control was paused (safety checks passing again).
+    #[ts(type = "number")]
+    pub evaluations_while_paused: i64,
     #[ts(type = "number")]
     pub windows_evaluated: i64,
     /// Windows with at least one `enter`.

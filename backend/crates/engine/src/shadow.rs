@@ -99,8 +99,11 @@ pub struct Ctx<'a> {
     pub oracle: &'a OracleState,
     pub cex: &'a CexState,
     pub books: &'a HashMap<String, BookState>,
-    /// Control is `running`.
-    pub running: bool,
+    /// Every safety check passes now. The shadow evaluates then even while control is paused
+    /// (a pause needs a manual resume, so it would otherwise lose hours of decisions).
+    pub safe: bool,
+    /// Control is `running`; stored with each evaluation.
+    pub control_running: bool,
 }
 
 /// One tick for one window: refresh its forecast, store due checkpoints, and (v0 assets, entry
@@ -134,7 +137,7 @@ pub fn on_tick(
 
     if ctx.cfg.v0_assets.contains(&w.id.asset) && ctx.cfg.v0.in_entry_window(secs_left) {
         let input = EvalInput {
-            running: ctx.running,
+            safe: ctx.safe,
             p_up: w.shadow.latest.as_ref().map(|p| p.p_up),
             config: market_config(w),
             up: side_book(ctx.books, w.rec.up_token.as_deref()),
@@ -271,6 +274,7 @@ fn eval_row(
         edge: ev.edge,
         action,
         reason,
+        control_running: ctx.control_running,
     }
 }
 

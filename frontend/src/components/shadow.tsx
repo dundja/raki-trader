@@ -4,7 +4,8 @@ import { fmtCents, fmtNum, fmtProb } from './fmt'
 
 /** Why strategy v0 skipped, in words (`reason` values of ShadowEvalRow). */
 export const SKIP_REASON: Record<string, string> = {
-  not_running: 'bot paused',
+  unsafe: 'a safety check failing',
+  not_running: 'bot paused (older rows)',
   no_prediction: 'no prediction',
   market_config: 'market config missing or unexpected',
   no_book: 'no order book',

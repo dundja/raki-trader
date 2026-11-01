@@ -222,6 +222,7 @@ function EvalsTable({ shadow }: { shadow: WindowShadow }) {
             <tr>
               <th className="num">Seconds left</th>
               <th>Decision</th>
+              <th>Bot</th>
               <th>Side</th>
               <th className="num">Model</th>
               <th className="num">Market</th>
@@ -235,6 +236,7 @@ function EvalsTable({ shadow }: { shadow: WindowShadow }) {
               <tr key={`${e.session_id}-${e.seq}`}>
                 <td className="num">{e.secs_left}</td>
                 <td>{e.action === 'enter' ? 'Enter' : `Skip: ${skipLabel(e.reason)}`}</td>
+                <td>{e.control_running ? 'running' : 'paused'}</td>
                 <td>{e.side ?? '—'}</td>
                 <td className="num">{fmtPct(e.model_prob)}</td>
                 <td className="num">{fmtProb(e.market_prob)}</td>

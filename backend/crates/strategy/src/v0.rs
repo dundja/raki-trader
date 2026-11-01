@@ -102,8 +102,8 @@ impl SideBook {
 
 #[derive(Clone, Debug)]
 pub struct EvalInput {
-    /// Control is `running` (which implies every safety check passed at the last tick).
-    pub running: bool,
+    /// Every safety check passes right now (feeds fresh, clock, geoblock, recorder, store).
+    pub safe: bool,
     pub p_up: Option<f64>,
     pub config: Result<MarketConfig, String>,
     pub up: Option<SideBook>,
@@ -113,7 +113,7 @@ pub struct EvalInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
-    NotRunning,
+    Unsafe,
     NoPrediction,
     MarketConfig,
     NoBook,
@@ -125,7 +125,7 @@ pub enum SkipReason {
 impl SkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            SkipReason::NotRunning => "not_running",
+            SkipReason::Unsafe => "unsafe",
             SkipReason::NoPrediction => "no_prediction",
             SkipReason::MarketConfig => "market_config",
             SkipReason::NoBook => "no_book",
@@ -169,11 +169,11 @@ impl Evaluation {
     }
 }
 
-/// Runs the v0 gates in order: running, prediction, market config, books, favourite, liquidity at
+/// Runs the v0 gates in order: safety, prediction, market config, books, favourite, liquidity at
 /// or below `max_entry_price` (at least the market's min size), edge.
 pub fn evaluate(p: &V0Params, input: &EvalInput) -> Evaluation {
-    if !input.running {
-        return Evaluation::skip(SkipReason::NotRunning);
+    if !input.safe {
+        return Evaluation::skip(SkipReason::Unsafe);
     }
     let Some(p_up) = input.p_up else {
         return Evaluation::skip(SkipReason::NoPrediction);
@@ -369,7 +369,7 @@ mod tests {
     /// Up is the favourite: bid 0.93, asks 0.94 (100); the model says 0.98.
     fn input() -> EvalInput {
         EvalInput {
-            running: true,
+            safe: true,
             p_up: Some(0.98),
             config: Ok(config()),
             up: side("0.93", &[("0.94", "100")]),
@@ -441,7 +441,7 @@ mod tests {
             f(&mut i);
             assert_eq!(reason(&evaluate(&p, &i)), Some(want));
         };
-        check(&|i| i.running = false, SkipReason::NotRunning);
+        check(&|i| i.safe = false, SkipReason::Unsafe);
         check(&|i| i.p_up = None, SkipReason::NoPrediction);
         check(&|i| i.config = Err("x".into()), SkipReason::MarketConfig);
         check(&|i| i.down = None, SkipReason::NoBook);

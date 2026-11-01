@@ -658,6 +658,8 @@ fn shadow_eval(session: Uuid, seq: i64, slug: &str, action: ShadowAction) -> Sha
         edge: Some(dec("0.036")),
         action,
         reason: (action == ShadowAction::Skip).then(|| "edge".into()),
+        // The skip happened while control was paused.
+        control_running: action == ShadowAction::Enter,
     }
 }
 
@@ -761,6 +763,7 @@ async fn shadow_rows_summary_and_calibration() {
 
     let sum = store.shadow_summary().await.unwrap();
     assert_eq!((sum.evaluations, sum.windows_evaluated, sum.windows_entered, sum.entries), (5, 3, 3, 4));
+    assert_eq!(sum.evaluations_while_paused, 1);
     assert_eq!((sum.filled, sum.partial, sum.no_fill), (2, 1, 1));
     assert_eq!((sum.resolved, sum.wins, sum.losses), (2, 1, 1));
     assert_eq!(sum.staked, dec("9.44"));

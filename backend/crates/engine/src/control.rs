@@ -7,6 +7,8 @@ use raki_core::{ControlState, SafetyChecks, StopKind, TradingMode};
 #[derive(Debug)]
 pub struct Control {
     state: ControlState,
+    /// Every safety check passed at the last [`on_safety`](Self::on_safety), whatever the mode.
+    safety_ok: bool,
 }
 
 impl Control {
@@ -20,11 +22,18 @@ impl Control {
                 needs_ack: false,
                 since_ms: now_ms,
             },
+            safety_ok: false,
         }
     }
 
     pub fn state(&self) -> ControlState {
         self.state.clone()
+    }
+
+    /// Whether every safety check passed at the last tick. A pause outlives the failure that
+    /// caused it; the shadow evaluates whenever this holds (and records the mode).
+    pub fn safety_ok(&self) -> bool {
+        self.safety_ok
     }
 
     /// Stops opening positions (manual).
@@ -69,6 +78,7 @@ impl Control {
     /// Called every tick: a failing check pauses a running bot; the first all-ok check after
     /// startup starts it (once — any later stop needs a manual resume).
     pub fn on_safety(&mut self, safety: &SafetyChecks, now_ms: i64) {
+        self.safety_ok = safety.all_ok;
         match (self.state.mode, self.state.stop_kind) {
             (TradingMode::Running, _) if !safety.all_ok => {
                 self.state = ControlState {

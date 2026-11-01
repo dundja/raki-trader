@@ -387,7 +387,8 @@ impl Engine {
             oracle: &self.oracle,
             cex: &self.cex,
             books: &self.books,
-            running: self.control.state().mode == TradingMode::Running,
+            safe: self.control.safety_ok(),
+            control_running: self.control.state().mode == TradingMode::Running,
         };
         for w in self.windows.values_mut() {
             shadow::on_tick(&ctx, w, now_ms, &mut self.eval_seq, out);
@@ -1231,6 +1232,16 @@ mod tests {
             reasons: vec![],
         };
         e.control().on_safety(&ok, t0);
+        // A failing check pauses the bot until a manual resume; once the checks pass again the
+        // shadow still evaluates, marked as made while paused.
+        let failing = SafetyChecks {
+            all_ok: false,
+            reasons: vec!["feed stale: binance".into()],
+            ..ok.clone()
+        };
+        e.control().on_safety(&failing, t0);
+        e.control().on_safety(&ok, t0);
+        assert_eq!(e.control().state().mode, TradingMode::Paused);
         // Spot at 100 ± 0.05 (σ = 0.1 per second) against a price to beat of 99.0: Up firms up
         // as the window runs out.
         let spot = |s: i64| FeedEvent::Oracle {
@@ -1288,6 +1299,7 @@ mod tests {
         // The previous window (no price to beat) used the first 16 numbers, skipping.
         assert_eq!((evals[0].seq, evals[0].secs_left), (16, 45));
         assert_eq!(evals[0].action, ShadowAction::Enter);
+        assert!(evals.iter().all(|ev| !ev.control_running));
         assert_eq!(evals[0].best_ask, Some(d("0.96")));
         assert_eq!((evals[1].seq, evals[1].secs_left), (17, 44));
         assert_eq!(evals[1].best_ask, Some(d("0.97")));

@@ -86,8 +86,8 @@ impl Store {
         sqlx::query(
             "insert into shadow_evals (session_id, seq, strategy_id, params_hash, slug, ts_ms, \
              secs_left, side, model_prob, market_prob, best_ask, walk_shares, walk_avg_price, \
-             walk_fee, edge, action, reason) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-             $11, $12, $13, $14, $15, $16, $17) on conflict do nothing",
+             walk_fee, edge, action, reason, control_running) values ($1, $2, $3, $4, $5, $6, $7, \
+             $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) on conflict do nothing",
         )
         .bind(parse_uuid(&e.session_id)?)
         .bind(e.seq)
@@ -106,6 +106,7 @@ impl Store {
         .bind(e.edge)
         .bind(enum_to_str(&e.action)?)
         .bind(&e.reason)
+        .bind(e.control_running)
         .execute(&self.pool)
         .await
         .context("insert shadow eval")?;
@@ -181,7 +182,9 @@ impl Store {
 
     pub async fn shadow_summary(&self) -> Result<ShadowSummary> {
         let evals = sqlx::query(
-            "select count(*) as evaluations, count(distinct slug) as windows, \
+            "select count(*) as evaluations, \
+             count(*) filter (where not control_running) as while_paused, \
+             count(distinct slug) as windows, \
              count(distinct slug) filter (where action = 'enter') as windows_entered, \
              count(*) filter (where action = 'enter') as entries from shadow_evals",
         )
@@ -236,6 +239,7 @@ impl Store {
         .context("shadow params hashes")?;
         Ok(ShadowSummary {
             evaluations: evals.try_get("evaluations")?,
+            evaluations_while_paused: evals.try_get("while_paused")?,
             windows_evaluated: evals.try_get("windows")?,
             windows_entered: evals.try_get("windows_entered")?,
             entries: evals.try_get("entries")?,
@@ -382,6 +386,7 @@ fn eval_from_row(r: &PgRow) -> Result<ShadowEvalRow> {
         edge: r.try_get::<Option<Decimal>, _>("edge")?,
         action: enum_from_str::<ShadowAction>(&r.try_get::<String, _>("action")?)?,
         reason: r.try_get("reason")?,
+        control_running: r.try_get("control_running")?,
     })
 }
 

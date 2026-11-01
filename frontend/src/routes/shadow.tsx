@@ -46,6 +46,7 @@ export function SummaryView({ s }: { s: ShadowSummary }) {
     <>
       <dl className="fields" data-testid="shadow-summary">
         <Field label="Evaluations">{fmtInt(s.evaluations)}</Field>
+        <Field label="…while the bot was paused">{fmtInt(s.evaluations_while_paused)}</Field>
         <Field label="BTC windows evaluated">{fmtInt(s.windows_evaluated)}</Field>
         <Field label="Windows with an entry">{fmtInt(s.windows_entered)}</Field>
         <Field label="Entries">{fmtInt(s.entries)}</Field>

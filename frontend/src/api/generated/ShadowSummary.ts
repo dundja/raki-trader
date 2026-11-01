@@ -4,7 +4,11 @@ import type { ReasonCount } from "./ReasonCount";
 /**
  * Everything v0's shadow did so far, all sessions.
  */
-export type ShadowSummary = { evaluations: number, windows_evaluated: number, 
+export type ShadowSummary = { evaluations: number, 
+/**
+ * Of those, made while control was paused (safety checks passing again).
+ */
+evaluations_while_paused: number, windows_evaluated: number, 
 /**
  * Windows with at least one `enter`.
  */
